@@ -5,6 +5,8 @@ mod hw;
 #[cfg(not(target_os = "xous"))]
 mod main_hosted;
 mod mappings;
+#[cfg(all(target_os = "xous", feature = "uvc"))]
+mod uvc;
 
 #[derive(num_derive::FromPrimitive, num_derive::ToPrimitive, Debug)]
 #[cfg(target_os = "xous")]
@@ -62,6 +64,7 @@ pub(crate) fn main_hw() -> ! {
     use utralib::{AtomicCsr, utra};
     use xous::msg_scalar_unpack;
     use xous_ipc::Buffer;
+    #[cfg(not(feature = "uvc"))]
     use xous_usb_hid::device::fido::RawFidoReport;
     use xous_usb_hid::page::Keyboard;
 
@@ -89,6 +92,26 @@ pub(crate) fn main_hw() -> ! {
         .expect("Missing PUBLIC_SERIAL in environment");
 
     let native_kbd = bao1x_api::keyboard::Keyboard::new(&xns).expect("couldn't connect to keyboard service");
+
+    // IFRAM staging buffer for UVC payloads. The USB core can only DMA out of IFRAM. This has to
+    // live for the lifetime of the process, so it is bound here in `main`'s scope.
+    // If the allocation fails, USB still comes up; the video function just refuses frames.
+    #[cfg(feature = "uvc")]
+    let mut uvc_staging = unsafe { bao1x_hal::ifram::IframRange::request(crate::uvc::STAGING_BYTES, None) };
+    #[cfg(feature = "uvc")]
+    let uvc_phys = match uvc_staging.as_ref() {
+        Some(range) => {
+            let phys = range.phys_range.as_ptr() as usize;
+            log::info!("UVC staging buffer at {:x}, {} bytes", phys, crate::uvc::STAGING_BYTES);
+            phys
+        }
+        None => {
+            log::error!("couldn't allocate IFRAM staging buffer for UVC; video streaming disabled");
+            0
+        }
+    };
+    #[cfg(not(feature = "uvc"))]
+    let uvc_phys = 0usize;
 
     let usb_mapping = xous::syscall::map_memory(
         xous::MemoryAddress::new(bao1x_hal::usb::utra::CORIGINE_USB_BASE),
@@ -145,7 +168,8 @@ pub(crate) fn main_hw() -> ! {
     //    another crate that implements the USB stack which can't handle Box'd structures.
     //  - It is safe to call `.init()` repeatedly because within `init()` we have an atomic bool that tracks
     //    if the interrupt handler has been hooked, and ignores further requests to hook it.
-    let mut cu = Box::new(Bao1xUsb::new(usb.clone(), irq_csr.clone(), cid, cw, &usb_alloc, &serial_number));
+    let mut cu =
+        Box::new(Bao1xUsb::new(usb.clone(), irq_csr.clone(), cid, cw, &usb_alloc, &serial_number, uvc_phys));
     cu.init();
 
     // Serial driver variables
@@ -166,6 +190,15 @@ pub(crate) fn main_hw() -> ! {
     // event observer connection
     let mut observer_conn: Option<xous::CID> = None;
     let mut observer_op: Option<usize> = None;
+
+    // UVC state: who to tell about stream start/stop, a frame waiting for the staging buffer to
+    // free up, and the frame ID bit that alternates between frames.
+    #[cfg(feature = "uvc")]
+    let mut uvc_observer: Option<(xous::CID, usize)> = None;
+    #[cfg(feature = "uvc")]
+    let mut uvc_pending: Option<xous::MessageEnvelope> = None;
+    #[cfg(feature = "uvc")]
+    let mut uvc_fid: u8 = 0;
 
     // manage FIDO Rx timeouts -- not tested yet
     let to_server = xous::create_server().unwrap();
@@ -287,6 +320,20 @@ pub(crate) fn main_hw() -> ! {
         let msg = msg_opt.as_mut().unwrap();
         let opcode = num_traits::FromPrimitive::from_usize(msg.body.id()).unwrap_or(Opcode::InvalidCall);
         log::debug!("{:?}", opcode);
+        #[cfg(feature = "uvc")]
+        {
+            cu.uvc.dbg.main_ticks.fetch_add(1, Ordering::SeqCst);
+            cu.uvc.dbg.last_opcode.store(msg.body.id() as u32, Ordering::SeqCst);
+            cu.uvc.dbg.listen_mode.store(
+                match serial_listen_mode {
+                    SerialListenMode::NoListener => 0,
+                    SerialListenMode::AsciiListener(_) => 1,
+                    SerialListenMode::BinaryListener => 2,
+                    SerialListenMode::ConsoleListener => 3,
+                },
+                Ordering::SeqCst,
+            );
+        }
         if cu.double_lock_detected() {
             log::warn!(
                 "Double lock error detected in USB stack. Meditations: services/usb-bao1x/src/hw.rs@226 (composite_handler inner loop) and consider adding more IRQ enable/disable similar to libs/bao1x-hal/src/usb/driver.rs@2549 (write impl)"
@@ -448,6 +495,12 @@ pub(crate) fn main_hw() -> ! {
                     buffer.replace(u2f_ipc).unwrap();
                     continue;
                 }
+                #[cfg(feature = "uvc")]
+                {
+                    // the FIDO transport is not part of the composite in UVC builds
+                    u2f_ipc.code = U2fCode::Hangup;
+                }
+                #[cfg(not(feature = "uvc"))]
                 if fido_listener_pid == msg.sender.pid() {
                     let mut u2f_msg = RawFidoReport::default();
                     assert_eq!(u2f_ipc.code, U2fCode::Tx, "Expected U2fCode::Tx in wrapper");
@@ -845,6 +898,108 @@ pub(crate) fn main_hw() -> ! {
                     }
                 }
             }
+            #[cfg(feature = "uvc")]
+            Opcode::RegisterUvcObserver => {
+                let buffer = unsafe { Buffer::from_memory_message(msg.body.memory_message().unwrap()) };
+                let ur = buffer.as_flat::<UsbListenerRegistration, _>().unwrap();
+                match xns.request_connection_blocking(ur.server_name.as_str()) {
+                    Ok(cid) => {
+                        let op = <u32 as From<u32>>::from(ur.listener_op_id.into()) as usize;
+                        log::info!("UVC observer registered: {} op {}", ur.server_name.as_str(), op);
+                        uvc_observer = Some((cid, op));
+                    }
+                    Err(e) => {
+                        log::error!("couldn't connect to UVC observer: {:?}", e);
+                    }
+                }
+            }
+            #[cfg(feature = "uvc")]
+            Opcode::UvcSendFrame => {
+                if !cu.uvc.is_streaming() || uvc_staging.is_none() {
+                    if let Some(mem) = msg.body.memory_message_mut() {
+                        mem.valid = xous::MemorySize::new(UVC_RESULT_NOT_STREAMING);
+                    }
+                } else if cu.uvc.frame_busy() {
+                    // the previous frame is still going out; hold the caller until it completes
+                    if uvc_pending.is_some() {
+                        log::warn!("UVC: second frame offered while one is already waiting; dropping");
+                        if let Some(mem) = msg.body.memory_message_mut() {
+                            mem.valid = xous::MemorySize::new(UVC_RESULT_NOT_STREAMING);
+                        }
+                    } else {
+                        uvc_pending = msg_opt.take();
+                    }
+                } else if let Some(staging) = uvc_staging.as_mut() {
+                    if uvc_stage_frame(msg, staging.as_slice_mut::<u8>(), &mut uvc_fid) {
+                        cu.uvc.set_frame_active();
+                        cu.sw_irq(UsbIrqReq::UvcKick);
+                    }
+                }
+            }
+            #[cfg(feature = "uvc")]
+            Opcode::IrqUvcFrameDone => {
+                if let Some(mut env) = uvc_pending.take() {
+                    match uvc_staging.as_mut() {
+                        Some(staging) if cu.uvc.is_streaming() && !cu.uvc.frame_busy() => {
+                            if uvc_stage_frame(&mut env, staging.as_slice_mut::<u8>(), &mut uvc_fid) {
+                                cu.uvc.set_frame_active();
+                                cu.sw_irq(UsbIrqReq::UvcKick);
+                            }
+                        }
+                        _ => {
+                            if let Some(mem) = env.body.memory_message_mut() {
+                                mem.valid = xous::MemorySize::new(UVC_RESULT_NOT_STREAMING);
+                            }
+                        }
+                    }
+                    // `env` drops here, which replies to the waiting frame source
+                }
+            }
+            #[cfg(feature = "uvc")]
+            Opcode::IrqUvcStreamChange => msg_scalar_unpack!(msg, state, _, _, _, {
+                log::info!("UVC stream {}", if state != 0 { "started" } else { "stopped" });
+                if let Some(mut env) = uvc_pending.take() {
+                    // any frame in progress was abandoned by the state change; the staging buffer
+                    // is free again.
+                    match uvc_staging.as_mut() {
+                        Some(staging) if state != 0 && cu.uvc.is_streaming() && !cu.uvc.frame_busy() => {
+                            if uvc_stage_frame(&mut env, staging.as_slice_mut::<u8>(), &mut uvc_fid) {
+                                cu.uvc.set_frame_active();
+                                cu.sw_irq(UsbIrqReq::UvcKick);
+                            }
+                        }
+                        _ => {
+                            if let Some(mem) = env.body.memory_message_mut() {
+                                mem.valid = xous::MemorySize::new(UVC_RESULT_NOT_STREAMING);
+                            }
+                        }
+                    }
+                }
+                if let Some((cid, op)) = uvc_observer {
+                    xous::try_send_message(cid, xous::Message::new_scalar(op, state, 0, 0, 0)).ok();
+                }
+            }),
+            Opcode::UvcStatus => {
+                if let Some(scalar) = msg.body.scalar_message_mut() {
+                    #[cfg(feature = "uvc")]
+                    {
+                        scalar.arg1 = if cu.uvc.is_streaming() { 1 } else { 0 };
+                        scalar.arg2 = cu.uvc.frames_sent() as usize;
+                    }
+                    #[cfg(not(feature = "uvc"))]
+                    {
+                        scalar.arg1 = 0;
+                        scalar.arg2 = 0;
+                    }
+                }
+            }
+            #[cfg(not(feature = "uvc"))]
+            Opcode::UvcSendFrame => {
+                if let Some(mem) = msg.body.memory_message_mut() {
+                    // `None` reads back as `UvcFrameResult::Unsupported`
+                    mem.valid = None;
+                }
+            }
             Opcode::LinkStatus => {
                 if let Some(scalar) = msg.body.scalar_message_mut() {
                     // to get the raw device state:
@@ -886,4 +1041,24 @@ pub(crate) fn main_hw() -> ! {
     xous::destroy_server(usbdev_sid).unwrap();
     log::info!("quitting");
     xous::terminate_process(0)
+}
+
+/// Copy the frame carried by a `UvcSendFrame` lend into the IFRAM staging buffer and set the
+/// reply code. Returns true if a frame was staged.
+#[cfg(all(target_os = "xous", feature = "uvc"))]
+fn uvc_stage_frame(env: &mut xous::MessageEnvelope, staging: &mut [u8], fid: &mut u8) -> bool {
+    let Some(mem) = env.body.memory_message_mut() else {
+        return false;
+    };
+    let len = mem.valid.map(|v| v.get()).unwrap_or(0);
+    let frame = unsafe { mem.buf.as_slice::<u8>() };
+    if len < api::UVC_FRAME_BYTES || frame.len() < api::UVC_FRAME_BYTES {
+        log::warn!("UVC: short frame offered ({} valid, {} buffer)", len, frame.len());
+        mem.valid = xous::MemorySize::new(api::UVC_RESULT_BAD_FRAME);
+        return false;
+    }
+    crate::uvc::stage_frame(staging, &frame[..api::UVC_FRAME_BYTES], *fid);
+    *fid ^= 1;
+    mem.valid = xous::MemorySize::new(api::UVC_RESULT_SENT);
+    true
 }

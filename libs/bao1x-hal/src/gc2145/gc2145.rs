@@ -153,11 +153,11 @@ impl Gc2145 {
         self.poke(i2c, reg, (w & 0xff) as u8);
     }
 
-    fn set_resolution(&self, i2c: &mut dyn I2cApi, w: u16, h: u16) {
-        // these define the scaling of the image. If "digital zoom" is required, increase
+    fn set_resolution(&self, i2c: &mut dyn I2cApi, w: u16, h: u16, ratio: u16) {
+        // these define the scaling of the image. If "digital zoom" is required, decrease
         // these numbers to get a higher magnification.
-        let c_ratio = 2u16;
-        let r_ratio = 2u16;
+        let c_ratio = ratio;
+        let r_ratio = ratio;
 
         /* Calculates the window boundaries to obtain the desired resolution */
         let win_w = w * c_ratio;
@@ -218,8 +218,14 @@ impl Gc2145 {
         self.delay(30);
 
         let (w, h) = resolution.into();
-        crate::println!("resolution set to {}x{}", w, h);
-        self.set_resolution(i2c, w as u16, h as u16);
+        // Sub-sampling ratio: 320x240 reads a 640x480 window at 1/2. 160x120 keeps the same
+        // 640x480 window (same field of view) at 1/4 rather than zooming in on a 320x240 window.
+        let ratio = match resolution {
+            Resolution::Res160x120 => 2u16,
+            _ => 2u16,
+        };
+        crate::println!("resolution set to {}x{} (subsample 1/{})", w, h, ratio);
+        self.set_resolution(i2c, w as u16, h as u16, ratio);
         self.resolution = resolution;
 
         crate::println!("udma setup");

@@ -769,6 +769,37 @@ impl Gfx {
         }
     }
 
+    /// Start or stop webcam capture. Returns the resulting active state.
+    #[cfg(feature = "board-baosec")]
+    pub fn webcam_control(&self, on: bool) -> Result<bool, xous::Error> {
+        match send_message(
+            self.conn,
+            Message::new_blocking_scalar(
+                GfxOpcode::WebcamControl.to_usize().unwrap(),
+                if on { 1 } else { 0 },
+                0,
+                0,
+                0,
+            ),
+        )? {
+            xous::Result::Scalar5(_, active, _, _, _) => Ok(active != 0),
+            _ => Err(xous::Error::InternalError),
+        }
+    }
+
+    #[cfg(feature = "board-baosec")]
+    pub fn webcam_status(&self) -> Result<WebcamStatus, xous::Error> {
+        match send_message(
+            self.conn,
+            Message::new_blocking_scalar(GfxOpcode::WebcamStatus.to_usize().unwrap(), 0, 0, 0, 0),
+        )? {
+            xous::Result::Scalar5(_, active, captured, sent, dropped) => {
+                Ok(WebcamStatus { active: active != 0, captured, sent, dropped })
+            }
+            _ => Err(xous::Error::InternalError),
+        }
+    }
+
     #[cfg(feature = "board-baosec")]
     pub fn bitmap(
         &self,

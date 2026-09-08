@@ -14,8 +14,11 @@ use usbd_serial::SerialPort;
 use utralib::{AtomicCsr, utra};
 use xous::Message;
 use xous_usb_hid::device::DeviceClass;
+#[cfg(not(feature = "uvc"))]
 use xous_usb_hid::device::fido::RawFido;
+#[cfg(not(feature = "uvc"))]
 use xous_usb_hid::device::fido::RawFidoConfig;
+#[cfg(not(feature = "uvc"))]
 use xous_usb_hid::device::fido::RawFidoReport;
 use xous_usb_hid::device::keyboard::KeyboardLedsReport;
 use xous_usb_hid::device::keyboard::{NKROBootKeyboard, NKROBootKeyboardConfig};
@@ -24,28 +27,38 @@ use xous_usb_hid::prelude::UsbHidClass;
 use xous_usb_hid::prelude::*;
 
 use crate::api::Opcode;
+#[cfg(feature = "uvc")]
+use crate::uvc::UvcClass;
 
 /// Maximum packet size for serial - tied to the speed of the port (HS)
 pub const SERIAL_MAX_PACKET_SIZE: usize = 512;
+
+/// The HID devices in the composite. The `uvc` feature replaces the FIDO transport with a video
+/// streaming function: the USB core only has four endpoint pairs, and FIDO's pair is the one we can
+/// spare (keyboard and serial stay).
+#[cfg(not(feature = "uvc"))]
+pub type HidDevices<'a> = frunk_core::hlist::HCons<
+    RawFido<'a, CorigineWrapper>,
+    frunk_core::hlist::HCons<NKROBootKeyboard<'a, CorigineWrapper>, frunk_core::hlist::HNil>,
+>;
+#[cfg(feature = "uvc")]
+pub type HidDevices<'a> =
+    frunk_core::hlist::HCons<NKROBootKeyboard<'a, CorigineWrapper>, frunk_core::hlist::HNil>;
 
 #[repr(align(32))]
 pub struct Bao1xUsb<'a> {
     pub conn: xous::CID,
     pub csr: AtomicCsr<u32>,
     pub irq_csr: AtomicCsr<u32>,
+    #[cfg(not(feature = "uvc"))]
     pub fido_tx_queue: RefCell<VecDeque<RawFidoReport>>,
     pub kbd_tx_queue: RefCell<VecDeque<Keyboard>>,
     pub irq_req: Option<UsbIrqReq>,
     pub wrapper: CorigineWrapper,
     pub device: UsbDevice<'a, CorigineWrapper>,
-    pub class: UsbHidClass<
-        'a,
-        CorigineWrapper,
-        frunk_core::hlist::HCons<
-            RawFido<'a, CorigineWrapper>,
-            frunk_core::hlist::HCons<NKROBootKeyboard<'a, CorigineWrapper>, frunk_core::hlist::HNil>,
-        >,
-    >,
+    pub class: UsbHidClass<'a, CorigineWrapper, HidDevices<'a>>,
+    #[cfg(feature = "uvc")]
+    pub uvc: UvcClass<'a, CorigineWrapper>,
     // storage for hid_packets to expatriate from the interrupt handler
     pub hid_packet: VecDeque<[u8; 64]>,
     pub serial_port: SerialPort<'a, CorigineWrapper, [u8; 1024], [u8; 1024]>,
@@ -57,6 +70,8 @@ pub struct Bao1xUsb<'a> {
     // from the interrupt handler.
     pub double_lock: AtomicBool,
     pub led_state: KeyboardLedsReport,
+    /// Set when a FIDO transmit request has been serviced by the interrupt handler
+    #[cfg_attr(feature = "uvc", allow(dead_code))]
     pub irq_serviced: AtomicBool,
 }
 
@@ -68,15 +83,23 @@ impl<'a> Bao1xUsb<'a> {
         cw: CorigineWrapper,
         usb_alloc: &'a UsbBusAllocator<CorigineWrapper>,
         serial_number: &'a String,
+        #[allow(unused_variables)] uvc_staging_phys: usize,
     ) -> Self {
+        #[cfg(not(feature = "uvc"))]
         let class = UsbHidClassBuilder::new()
             .add_device(NKROBootKeyboardConfig::default())
             .add_device(RawFidoConfig::default())
             .build(usb_alloc);
+        #[cfg(feature = "uvc")]
+        let class = UsbHidClassBuilder::new().add_device(NKROBootKeyboardConfig::default()).build(usb_alloc);
 
         let rx_buf = [0u8; SERIAL_MAX_PACKET_SIZE * 2];
         let tx_buf = [0u8; SERIAL_MAX_PACKET_SIZE * 2];
         let serial_port = SerialPort::new_with_store(&usb_alloc, rx_buf, tx_buf);
+        // allocated last, so that its explicitly-numbered endpoint doesn't collide with the
+        // automatically allocated ones above
+        #[cfg(feature = "uvc")]
+        let uvc = UvcClass::new(usb_alloc, cw.hw.clone(), cid, uvc_staging_phys);
         // HACK ALERT: due to a shortcoming in the usb-device implementation, inside the interrupt handler we
         // have to catch and parse SETUP-OUT sequences. Basically the driver assumes that the OUT endpoint is
         // always configured to trigger, but in our stack every time we have an OUT on EP0, we have to
@@ -113,8 +136,11 @@ impl<'a> Bao1xUsb<'a> {
             wrapper: cw,
             device,
             class,
+            #[cfg(feature = "uvc")]
+            uvc,
             csr,
             irq_csr,
+            #[cfg(not(feature = "uvc"))]
             fido_tx_queue: RefCell::new(VecDeque::new()),
             kbd_tx_queue: RefCell::new(VecDeque::new()),
             irq_req: None,
@@ -176,7 +202,12 @@ impl<'a> Bao1xUsb<'a> {
 
         // reset all shared data structures
         self.device.force_reset().ok();
-        self.fido_tx_queue = RefCell::new(VecDeque::new());
+        #[cfg(not(feature = "uvc"))]
+        {
+            self.fido_tx_queue = RefCell::new(VecDeque::new());
+        }
+        #[cfg(feature = "uvc")]
+        self.uvc.reset_state();
         self.kbd_tx_queue = RefCell::new(VecDeque::new());
         self.irq_req = None;
         self.wrapper.event = None;
@@ -249,8 +280,12 @@ impl<'a> Bao1xUsb<'a> {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum UsbIrqReq {
+    #[cfg(not(feature = "uvc"))]
     FidoTx,
     KbdTx,
+    /// A frame has been staged for the UVC streamer
+    #[cfg(feature = "uvc")]
+    UvcKick,
 }
 
 pub const CORIGINE_IRQ_MASK: u32 = 0x1;
@@ -329,7 +364,13 @@ pub(crate) fn composite_handler(_irq_no: usize, arg: *mut usize) {
                 let device = usb.device.borrow_mut();
                 let class = usb.class.borrow_mut();
                 let serial = usb.serial_port.borrow_mut();
-                if device.poll(&mut [class, serial as &mut dyn UsbClass<_>]) {
+                #[cfg(feature = "uvc")]
+                let uvc = usb.uvc.borrow_mut();
+                #[cfg(not(feature = "uvc"))]
+                let polled = device.poll(&mut [class, serial as &mut dyn UsbClass<_>]);
+                #[cfg(feature = "uvc")]
+                let polled = device.poll(&mut [class, serial as &mut dyn UsbClass<_>, uvc]);
+                if polled {
                     if let Ok(count) = serial.read(&mut usb.serial_rx) {
                         xous::try_send_message(
                             usb.conn,
@@ -350,6 +391,7 @@ pub(crate) fn composite_handler(_irq_no: usize, arg: *mut usize) {
                     // fallible), so we use a pre-allocated storage (usb.hid_packet) to
                     // pass the data to userspace, which is then notified with `IrqFidoRx`
                     // to read the stashed data
+                    #[cfg(not(feature = "uvc"))]
                     match class.device::<RawFido<'_, _>, _>().read_report() {
                         Ok(u2f_report) => {
                             // crate::println!("got report {:x?}", u2f_report);
@@ -396,9 +438,20 @@ pub(crate) fn composite_handler(_irq_no: usize, arg: *mut usize) {
         if usb.csr.rf(IMAN_IE) != 0 {
             usb.csr.wo(IMAN, usb.csr.ms(IMAN_IE, 1) | usb.csr.ms(IMAN_IP, 1));
         }
-    } else if (pending & SW_IRQ_MASK) != 0 {
+    }
+    // Service software requests. This is deliberately not an `else` on the hardware branch: if a
+    // request is posted while a hardware interrupt is pending, both bits are set and the request
+    // would otherwise be left in `irq_req` until the next software trigger.
+    if (pending & SW_IRQ_MASK) != 0 || usb.irq_req.is_some() {
+        service_sw_request(usb);
+    }
+}
+
+fn service_sw_request(usb: &mut Bao1xUsb) {
+    {
         let composite = usb.class.borrow_mut();
         match usb.irq_req.take() {
+            #[cfg(not(feature = "uvc"))]
             Some(UsbIrqReq::FidoTx) => {
                 let u2f = composite.device::<RawFido<'_, _>, _>();
                 // you know, I'm not 100% sure we *can* write multiple reports without taking
@@ -418,6 +471,11 @@ pub(crate) fn composite_handler(_irq_no: usize, arg: *mut usize) {
                 keyboard.write_report(kbd_events).ok();
                 usb.kbd_tx_queue.borrow_mut().clear();
                 keyboard.tick().ok();
+            }
+            #[cfg(feature = "uvc")]
+            Some(UsbIrqReq::UvcKick) => {
+                usb.uvc.dbg.kicks.fetch_add(1, Ordering::SeqCst);
+                usb.uvc.kick();
             }
             None => (),
         }

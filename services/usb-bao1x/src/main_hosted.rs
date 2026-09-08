@@ -42,6 +42,17 @@ pub(crate) fn main_hosted() -> ! {
             Some(Opcode::ResetBlockDevice) => {
                 log::info!("ignoring ResetBlockDevice in hosted mode");
             }
+            Some(Opcode::UvcStatus) => msg_blocking_scalar_unpack!(msg, _, _, _, _, {
+                xous::return_scalar2(msg.sender, 0, 0).expect("couldn't return UVC status")
+            }),
+            Some(Opcode::UvcSendFrame) => {
+                if let Some(mem) = msg.body.memory_message_mut() {
+                    mem.valid = None;
+                }
+            }
+            Some(Opcode::RegisterUvcObserver) => {
+                log::info!("ignoring RegisterUvcObserver in hosted mode");
+            }
             Some(Opcode::IsSocCompatible) => msg_blocking_scalar_unpack!(msg, _, _, _, _, {
                 xous::return_scalar(msg.sender, 1).expect("couldn't return compatibility status")
             }),

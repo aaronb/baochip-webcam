@@ -891,6 +891,11 @@ pub struct CorigineUsb {
     pub readout: [Option<[u8; CRG_UDC_APP_BUF_LEN]>; CRG_EP_NUM],
     pub setup: Option<[u8; 8]>,
     pub setup_tag: u8,
+    /// SETUP packet of the most recent class-specific, interface-directed OUT request with a data
+    /// stage (bmRequestType 0x21, bRequest SET_CUR). Its data stage is swallowed by hardware (see
+    /// `ep0_receive`), so this is the only way a class finds out the request happened. Consumed
+    /// by the class from its `poll()` callback.
+    pub last_class_out_setup: Option<[u8; 8]>,
     stall_spec: [Option<bool>; CRG_EP_NUM * 2 + 2],
 
     pub max_packet_size: [Option<usize>; CRG_EP_NUM * 2 + 2],
@@ -967,6 +972,7 @@ impl CorigineUsb {
             udc_event: UdcEvent::default(),
             readout: [None; CRG_EP_NUM],
             setup: None,
+            last_class_out_setup: None,
             stall_spec: [None; CRG_EP_NUM * 2 + 2],
             max_packet_size: [None; CRG_EP_NUM * 2 + 2],
             app_enq_index: [0; CRG_EP_NUM + 1],
@@ -1884,6 +1890,11 @@ impl CorigineUsb {
         Ok(())
     }
 
+    /// Post a receive for the data stage of a control OUT request, followed by the status stage.
+    /// The data is received into `addr` and completed entirely by hardware: no completion event
+    /// is raised for it, and the USB stack never sees the data. (Delivering it to the stack was
+    /// tried and wedges EP0 on this core; see `last_class_out_setup` for how a class learns that
+    /// such a request happened.)
     fn ep0_receive(&mut self, addr: usize, length: usize, intr_target: u32) {
         let udc_ep = &mut self.udc_ep[0];
         let mut enq_pt =
@@ -2226,7 +2237,10 @@ impl CorigineUsb {
                 //num_trb > 1,  last trb
                 tmp_len = if len % MAX_TRB_XFER_LEN != 0 { len % MAX_TRB_XFER_LEN } else { MAX_TRB_XFER_LEN };
                 ioc = true;
-                chain_bit = true;
+                // The last TRB ends the TD. Chaining it would make the controller continue into
+                // whatever stale entry follows in the ring (`CRG_XFER_SET_CHAIN` below is the
+                // explicit opt-in for callers that really do want to continue the TD later).
+                chain_bit = false;
             }
 
             if transfer_flag & CRG_XFER_NO_INTR != 0 {
@@ -3033,6 +3047,14 @@ pub fn handle_event_inner(this: &mut CorigineUsb, event_trb: &mut EventTrbS) -> 
                     "HACK: setup ep0 receive for ACM class - we ignore the result, but the receive must exist"
                 );
                 this.ep0_receive_bounded(7, 0).expect("7 <= EP0 buffer");
+            } else if setup_storage[0] == 0x21 && setup_storage[1] == 0x01 {
+                // Video class SET_CUR (PROBE/COMMIT) to an interface: same situation as ACM above. The
+                // data stage (26 or 34 bytes) is received into the EP0 buffer and ignored; the class
+                // replies with its own fixed parameters.
+                let len = u16::from_le_bytes([setup_storage[6], setup_storage[7]]) as usize;
+                if len > 0 && this.ep0_receive_bounded(len, 0).is_ok() {
+                    this.last_class_out_setup = Some(setup_storage);
+                }
             }
 
             ret = CrgEvent::Data(0, 0, 1);

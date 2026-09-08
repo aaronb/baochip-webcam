@@ -71,6 +71,21 @@ pub enum Opcode {
     /// Interrupt-context USB stack messages
     IrqFidoRx = 768,
     IrqSerialRx = 769,
+    /// UVC streamer finished transmitting the staged frame
+    #[cfg(feature = "uvc")]
+    IrqUvcFrameDone = 770,
+    /// UVC stream started (arg1 = 1) or stopped (arg1 = 0) by the host
+    #[cfg(feature = "uvc")]
+    IrqUvcStreamChange = 771,
+
+    /// Lend a raw UYVY frame for transmission over UVC. The `valid` field carries the frame length
+    /// in, and a `UVC_RESULT_*` code out. Ignored (with an error reply) when built without `uvc`.
+    UvcSendFrame = 1100,
+    /// Register a server to be notified when the host starts (arg1 = 1) or stops (arg1 = 0) the
+    /// video stream.
+    RegisterUvcObserver = 1101,
+    /// Query UVC stream state: returns (streaming, frames_sent)
+    UvcStatus = 1102,
 
     #[cfg(feature = "mass-storage")]
     SetBlockDevice = 1024,
@@ -246,4 +261,28 @@ impl TryFrom<usize> for LogLevel {
             _ => Err("Invalid LogLevel"),
         }
     }
+}
+
+// ---- UVC (USB video class) ----
+/// Frame geometry served over UVC. The frame buffer format is UYVY (2 bytes per pixel).
+pub const UVC_WIDTH: usize = 160;
+pub const UVC_HEIGHT: usize = 120;
+pub const UVC_FRAME_BYTES: usize = UVC_WIDTH * UVC_HEIGHT * 2;
+
+/// Result codes returned in the `valid` field of a `UvcSendFrame` lend
+pub const UVC_RESULT_SENT: usize = 1;
+pub const UVC_RESULT_NOT_STREAMING: usize = 2;
+pub const UVC_RESULT_BAD_FRAME: usize = 3;
+
+#[allow(dead_code)] // used by the client library side of this crate
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum UvcFrameResult {
+    /// The frame was accepted and transmitted to the host
+    Sent,
+    /// The host has not started (or has stopped) the stream; the frame was discarded
+    NotStreaming,
+    /// The lent buffer was too short
+    BadFrame,
+    /// The USB service was built without UVC support
+    Unsupported,
 }

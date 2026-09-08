@@ -341,6 +341,59 @@ impl UsbHid {
             .expect("couldn't register listener");
     }
 
+    /// Register a server to be notified when the USB host starts or stops the UVC video stream.
+    /// The observer receives a scalar message with `action_opcode` and `arg1` = 1 (started) or
+    /// 0 (stopped).
+    pub fn register_uvc_observer(&self, server_name: &str, action_opcode: usize) {
+        let kr =
+            UsbListenerRegistration { server_name: String::from(server_name), listener_op_id: action_opcode };
+        let buf = Buffer::into_buf(kr).unwrap();
+        buf.lend(self.conn, Opcode::RegisterUvcObserver.to_u32().unwrap())
+            .expect("couldn't register listener");
+    }
+
+    /// Lend a raw UYVY frame of `UVC_FRAME_BYTES` bytes to the USB service for transmission over
+    /// the UVC bulk endpoint. `frame` must be a page-aligned, page-sized mapping (as returned by
+    /// `xous::map_memory`). Blocks until the frame has been transmitted, or discarded because the
+    /// host is not streaming.
+    pub fn uvc_send_frame(
+        &self,
+        frame: xous::MemoryRange,
+        len: usize,
+    ) -> Result<UvcFrameResult, xous::Error> {
+        match send_message(
+            self.conn,
+            // a mutable lend: the service reports the result back in the `valid` field, and the
+            // kernel only carries that back to the caller for mutable borrows
+            Message::new_lend_mut(
+                Opcode::UvcSendFrame.to_usize().unwrap(),
+                frame,
+                None,
+                xous::MemorySize::new(len),
+            ),
+        )? {
+            xous::Result::MemoryReturned(_offset, valid) => Ok(match valid.map(|v| v.get()) {
+                Some(UVC_RESULT_SENT) => UvcFrameResult::Sent,
+                Some(UVC_RESULT_NOT_STREAMING) => UvcFrameResult::NotStreaming,
+                Some(UVC_RESULT_BAD_FRAME) => UvcFrameResult::BadFrame,
+                _ => UvcFrameResult::Unsupported,
+            }),
+            _ => Err(xous::Error::InternalError),
+        }
+    }
+
+    /// Returns `(streaming, frames_sent)` for the UVC function. `streaming` is false when the
+    /// service was built without UVC support.
+    pub fn uvc_status(&self) -> Result<(bool, u32), xous::Error> {
+        match send_message(
+            self.conn,
+            Message::new_blocking_scalar(Opcode::UvcStatus.to_usize().unwrap(), 0, 0, 0, 0),
+        )? {
+            xous::Result::Scalar5(_, streaming, frames, _, _) => Ok((streaming != 0, frames as u32)),
+            _ => Err(xous::Error::InternalError),
+        }
+    }
+
     /// Sets the userland application HID device descriptor.
     /// It cannot be longer than 1024 bytes.
     pub fn connect_hid_app(&self, descriptor: Vec<u8>) -> Result<(), xous::Error> {

@@ -121,6 +121,17 @@ pub enum GfxOpcode {
     /// warm up UI routines from swap memory to improve UI latency.
     #[cfg(feature = "board-baosec")]
     DryRun,
+    /// Start (arg1 = 1) or stop (arg1 = 0) webcam capture: frames are forwarded to the USB
+    /// video class function. Sent by the USB service's stream observer callback, and by the
+    /// console. If sent as a blocking scalar, arg1 of the reply is the resulting active state.
+    #[cfg(feature = "board-baosec")]
+    WebcamControl,
+    /// Blocking scalar; returns (active, frames captured, frames sent to USB, frames dropped)
+    #[cfg(feature = "board-baosec")]
+    WebcamStatus,
+    /// Internal: checks that frames are arriving after a webcam start; restarts the camera if not
+    #[cfg(feature = "board-baosec")]
+    WebcamWatchdog,
 
     /// Gutter for invalid calls
     InvalidCall,
@@ -178,4 +189,18 @@ pub struct BaosecBitmap {
     pub top_left: crate::minigfx::Point,
     // bounding box of the bitmap - if we want only a portion of the bitmap to be drawn
     pub bounding_box: crate::minigfx::Rectangle,
+}
+
+/// Webcam capture statistics, see `GfxOpcode::WebcamStatus`
+#[cfg(feature = "board-baosec")]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct WebcamStatus {
+    /// camera is powered and capturing
+    pub active: bool,
+    /// frames captured since the camera was last started
+    pub captured: usize,
+    /// frames accepted and transmitted by the USB service
+    pub sent: usize,
+    /// frames discarded because the host was not streaming
+    pub dropped: usize,
 }

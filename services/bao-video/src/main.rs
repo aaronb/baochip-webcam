@@ -44,6 +44,8 @@ use bao1x_hal_service::UdmaGlobal;
 #[cfg(feature = "b64-export")]
 use base64::{Engine as _, engine::general_purpose};
 use num_traits::*;
+#[cfg(feature = "uvc")]
+use usb_bao1x::{UVC_FRAME_BYTES, UvcFrameResult};
 #[cfg(not(feature = "hosted-baosec"))]
 use utralib::utra;
 use ux_api::minigfx::{self, FrameBuffer};
@@ -192,6 +194,110 @@ fn handle_irq(_irq_no: usize, arg: *mut usize) {
         xous::Message::new_scalar(GfxOpcode::CamIrq.to_usize().unwrap(), pending as usize, 0, 0, 0),
     )
     .ok();
+}
+
+/// Webcam (UVC) capture state
+#[cfg(feature = "uvc")]
+struct WebcamState {
+    active: bool,
+    /// page-aligned RAM copy of the latest frame, lent to the USB service
+    frame: xous::MemoryRange,
+    captured: usize,
+    sent: usize,
+    dropped: usize,
+    restarts: usize,
+}
+
+#[cfg(feature = "uvc")]
+impl WebcamState {
+    fn new() -> Self {
+        let pages = (UVC_FRAME_BYTES + 4095) / 4096;
+        let frame = xous::map_memory(None, None, pages * 4096, xous::MemoryFlags::R | xous::MemoryFlags::W)
+            .expect("couldn't allocate webcam frame buffer");
+        WebcamState { active: false, frame, captured: 0, sent: 0, dropped: 0, restarts: 0 }
+    }
+}
+
+/// Bring the camera out of power-down: start MCLK, release PWDN. Mirrors the sequence used for QR
+/// acquisition.
+#[cfg(feature = "uvc")]
+fn camera_power_up(
+    iox: &IoxHal,
+    timer: &mut utralib::CSR<u32>,
+    cam_clk: (IoxPort, u8),
+    cam_pdwn: (IoxPort, u8),
+    tt: &ticktimer::Ticktimer,
+) {
+    iox.setup_pin(
+        cam_clk.0,
+        cam_clk.1,
+        Some(IoxDir::Output),
+        Some(IoxFunction::AF3),
+        None,
+        None,
+        Some(IoxEnable::Disable),
+        Some(IoxDriveStrength::Drive8mA),
+    );
+    timer.wo(utra::pwm::REG_CH_EN, 1);
+    timer.rmwf(utra::pwm::REG_TIM0_CMD_R_TIMER0_START, 1);
+    tt.sleep_ms(10).ok(); // wait for camera to clock-up
+    iox.set_gpio_pin_value(cam_pdwn.0, cam_pdwn.1, IoxValue::Low);
+    tt.sleep_ms(10).ok(); // wait for camera to power-up
+}
+
+/// Put the camera into power-down and stop MCLK.
+#[cfg(feature = "uvc")]
+fn camera_power_down(
+    iox: &IoxHal,
+    timer: &mut utralib::CSR<u32>,
+    cam_clk: (IoxPort, u8),
+    cam_pdwn: (IoxPort, u8),
+    tt: &ticktimer::Ticktimer,
+) {
+    iox.set_gpio_pin_value(cam_pdwn.0, cam_pdwn.1, IoxValue::High);
+    tt.sleep_ms(2).ok();
+    timer.rmwf(utra::pwm::REG_TIM0_CMD_R_TIMER0_START, 0);
+    timer.wo(utra::pwm::REG_CH_EN, 0);
+    iox.setup_pin(cam_clk.0, cam_clk.1, Some(IoxDir::Input), Some(IoxFunction::Gpio), None, None, None, None);
+}
+
+/// Power the camera up, configure it for the webcam frame size, and start the first capture.
+#[cfg(feature = "uvc")]
+fn webcam_start_capture(
+    cam: &mut Gc2145,
+    i2c: &mut I2c,
+    iox: &IoxHal,
+    timer: &mut utralib::CSR<u32>,
+    cam_clk: (IoxPort, u8),
+    cam_pdwn: (IoxPort, u8),
+    tt: &ticktimer::Ticktimer,
+    udma_global: &UdmaGlobal,
+) {
+    udma_global.reset(PeriphId::Cam);
+    camera_power_up(iox, timer, cam_clk, cam_pdwn, tt);
+    let (pid, mid) = cam.read_id(i2c);
+    log::info!("webcam: camera pid {:x}, mid {:x}", pid, mid);
+    cam.init(i2c, bao1x_api::camera::Resolution::Res160x120);
+    tt.sleep_ms(15).ok();
+    cam.disable_slicing();
+    let (cols, rows) = cam.resolution();
+    assert!(cols * rows * 2 == UVC_FRAME_BYTES, "camera frame size doesn't match the UVC frame size");
+    cam.capture_async();
+}
+
+/// Schedule a `WebcamWatchdog` check: if no frame has arrived by then, the camera is restarted.
+#[cfg(feature = "uvc")]
+fn webcam_arm_watchdog(cid: CID, captured_now: usize, tt: &ticktimer::Ticktimer) {
+    let _ = tt;
+    std::thread::spawn(move || {
+        let tt = ticktimer::Ticktimer::new().unwrap();
+        tt.sleep_ms(2500).ok();
+        xous::try_send_message(
+            cid,
+            xous::Message::new_scalar(GfxOpcode::WebcamWatchdog.to_usize().unwrap(), captured_now, 0, 0, 0),
+        )
+        .ok();
+    });
 }
 
 fn main() -> ! {
@@ -414,6 +520,15 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
         irq_csr.wfo(utra::irqarray8::EV_ENABLE_CAM_RX, 1);
     }
 
+    // ---- webcam (UVC) setup: a page-aligned RAM buffer to hand frames to the USB service, and a
+    // registration so the USB service tells us when the host opens or closes the video stream.
+    #[cfg(feature = "uvc")]
+    let usb = usb_bao1x::UsbHid::new();
+    #[cfg(feature = "uvc")]
+    usb.register_uvc_observer(SERVER_NAME_GFX, GfxOpcode::WebcamControl.to_usize().unwrap());
+    #[cfg(feature = "uvc")]
+    let mut webcam = WebcamState::new();
+
     // ---- main loop variables
     let screen_clip = Rectangle::new(Point::new(0, 0), display.screen_size());
     let screen_size = display.screen_size(); // make a copy so the borrow checker doesn't complain
@@ -451,6 +566,12 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
             match opcode {
                 #[cfg(not(feature = "hosted-baosec"))]
                 GfxOpcode::AcquireQr => {
+                    #[cfg(feature = "uvc")]
+                    if webcam.active {
+                        // the camera is busy streaming to USB; reply with no content
+                        log::warn!("QR acquisition requested while webcam is active; refusing");
+                        continue;
+                    }
                     if qr_request.is_none() {
                         // decode dummy data - what this does is load the swapped out QR decoding logic, thus
                         // improving the latency of the decoder on the "first hit". The sole purpose of this
@@ -645,6 +766,34 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                     }
                 }
                 GfxOpcode::CamIrq => {
+                    #[cfg(feature = "uvc")]
+                    if webcam.active {
+                        // Copy the frame out of the camera IFRAM as words (it is uncached and slow to
+                        // read), re-arm the capture so the next frame lands while this one is sent,
+                        // then hand the copy to the USB service. That call blocks until the frame
+                        // has gone out, or is discarded because the host isn't streaming.
+                        {
+                            let fb: &[u32] = cam.rx_buf();
+                            let words = UVC_FRAME_BYTES / core::mem::size_of::<u32>();
+                            let dst = unsafe { webcam.frame.as_slice_mut::<u32>() };
+                            dst[..words].copy_from_slice(&fb[..words]);
+                        }
+                        webcam.captured += 1;
+                        cam.capture_async();
+                        match usb.uvc_send_frame(webcam.frame, UVC_FRAME_BYTES) {
+                            Ok(UvcFrameResult::Sent) => webcam.sent += 1,
+                            Ok(UvcFrameResult::NotStreaming) => webcam.dropped += 1,
+                            Ok(other) => {
+                                log::warn!("UVC frame refused: {:?}", other);
+                                webcam.dropped += 1;
+                            }
+                            Err(e) => {
+                                log::error!("UVC frame send failed: {:?}", e);
+                                webcam.dropped += 1;
+                            }
+                        }
+                        continue;
+                    }
                     // copy the camera data to our FB
                     let fb: &[u32] = cam.rx_buf();
                     // fb is an array of IMAGE_WIDTH x IMAGE_HEIGHT x u16
@@ -824,6 +973,89 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
 
                     // clear the front buffer
                     display.clear();
+                }
+                #[cfg(feature = "uvc")]
+                GfxOpcode::WebcamControl => {
+                    let on = msg.body.scalar_message().map(|s| s.arg1 != 0).unwrap_or(false);
+                    if on {
+                        if webcam.active {
+                            log::debug!("webcam already active");
+                        } else if qr_request.is_some() {
+                            log::warn!("webcam start refused: QR acquisition in progress");
+                        } else {
+                            webcam.active = true;
+                            webcam.captured = 0;
+                            webcam.sent = 0;
+                            webcam.dropped = 0;
+                            webcam.restarts = 0;
+                            webcam_start_capture(
+                                &mut cam,
+                                &mut i2c,
+                                &iox,
+                                &mut timer,
+                                cam_clk,
+                                cam_pdwn,
+                                &tt,
+                                &udma_global,
+                            );
+                            webcam_arm_watchdog(cid, webcam.captured, &tt);
+                            log::info!("webcam started");
+                        }
+                    } else if webcam.active {
+                        webcam.active = false;
+                        camera_power_down(&iox, &mut timer, cam_clk, cam_pdwn, &tt);
+                        log::info!(
+                            "webcam stopped: {} captured, {} sent, {} dropped",
+                            webcam.captured,
+                            webcam.sent,
+                            webcam.dropped
+                        );
+                    }
+                    if let Some(scalar) = msg.body.scalar_message_mut() {
+                        scalar.arg1 = if webcam.active { 1 } else { 0 };
+                    }
+                }
+                #[cfg(feature = "uvc")]
+                GfxOpcode::WebcamWatchdog => {
+                    if let Some(scalar) = msg.body.scalar_message() {
+                        let captured_at_arm = scalar.arg1;
+                        if webcam.active && webcam.captured == captured_at_arm {
+                            const RESTART_LIMIT: usize = 3;
+                            if webcam.restarts < RESTART_LIMIT {
+                                webcam.restarts += 1;
+                                log::warn!(
+                                    "webcam: no frames since start, restarting camera ({}/{})",
+                                    webcam.restarts,
+                                    RESTART_LIMIT
+                                );
+                                camera_power_down(&iox, &mut timer, cam_clk, cam_pdwn, &tt);
+                                webcam_start_capture(
+                                    &mut cam,
+                                    &mut i2c,
+                                    &iox,
+                                    &mut timer,
+                                    cam_clk,
+                                    cam_pdwn,
+                                    &tt,
+                                    &udma_global,
+                                );
+                                webcam_arm_watchdog(cid, webcam.captured, &tt);
+                            } else {
+                                log::error!("webcam: camera never produced a frame; giving up");
+                                webcam.active = false;
+                                camera_power_down(&iox, &mut timer, cam_clk, cam_pdwn, &tt);
+                            }
+                        }
+                    }
+                }
+                #[cfg(feature = "uvc")]
+                GfxOpcode::WebcamStatus => {
+                    if let Some(scalar) = msg.body.scalar_message_mut() {
+                        scalar.arg1 = if webcam.active { 1 } else { 0 };
+                        scalar.arg2 = webcam.captured;
+                        scalar.arg3 = webcam.sent;
+                        scalar.arg4 = webcam.dropped;
+                    }
                 }
                 GfxOpcode::InvalidCall => {
                     log::error!("Invalid call to bao video server: {:?}", msg);
