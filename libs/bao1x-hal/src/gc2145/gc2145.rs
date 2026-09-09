@@ -306,7 +306,7 @@ impl Gc2145 {
         // Sub-sampling ratio: 320x240 reads a 640x480 window at 1/2. 160x120 keeps the same
         // 640x480 window (same field of view) at 1/4 rather than zooming in on a 320x240 window.
         let ratio = match resolution {
-            Resolution::Res160x120 => 8u16, // TRIAL: 1280x960 window, ~80% of the sensor width
+            Resolution::Res160x120 => 4u16,
             _ => 2u16,
         };
         // Full-frame capture (no slicing) shows the first ~6 pixels of every line as dark:
