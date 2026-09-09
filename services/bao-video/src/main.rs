@@ -223,6 +223,12 @@ struct WebcamState {
     frame_locked: bool,
     /// sensor clock divider register (0xfa) to apply for ratio-1 geometries (bring-up knob)
     clkdiv_ratio1: u8,
+    /// draw a dithered preview of the captured frames on the OLED
+    preview: bool,
+    /// elapsed-ms timestamp of the last completed frame, for the preview's rate figure
+    last_frame_ms: u64,
+    /// frame rate in tenths of a frame per second, for the preview status line
+    fps_x10: u32,
     /// The first capture session after boot shows a 6-px stale band somewhere in every line
     /// (measured: only the first DMA run after a cold boot, never the sessions after it). The
     /// first session therefore restarts itself after a few frames.
@@ -258,6 +264,9 @@ impl WebcamState {
             frame_locked: false,
             clkdiv_ratio1: 0x19,
             first_session: true,
+            preview: true,
+            last_frame_ms: 0,
+            fps_x10: 0,
             pinned: false,
             exposure_mode: WebcamExposureMode::Auto,
             exposure_applied: false,
@@ -357,6 +366,81 @@ fn webcam_slice_band(cam: &mut Gc2145, mode: &UvcMode, band: usize) -> usize {
     let rows = mode.band_rows.min(mode.height - y0);
     cam.set_slicing((0, y0), (mode.line_px(), y0 + rows + 1));
     rows
+}
+
+/// Preview geometry: pixels of the image per preview pixel (1 = crop), and the image offset so
+/// the preview is centred. The OLED is 128 wide; the preview uses rows 0..PREVIEW_ROWS and the
+/// status line sits below it.
+#[cfg(feature = "uvc")]
+const PREVIEW_ROWS: usize = 116;
+#[cfg(feature = "uvc")]
+fn preview_geometry(mode: &UvcMode) -> (usize, usize, usize, usize) {
+    let step = (mode.width / 128).max(1);
+    let cols = (mode.width / step).min(128);
+    let rows = (mode.height / step).min(PREVIEW_ROWS);
+    let x0 = (mode.width - cols * step) / 2;
+    let y0 = (mode.height - rows * step) / 2;
+    (step, x0, y0, rows)
+}
+
+/// Render image rows `first_row..first_row + n` (from a chunk buffer holding exactly those rows,
+/// UYVY, `mode.width` wide) onto the OLED with an ordered 4x4 dither.
+#[cfg(feature = "uvc")]
+fn webcam_preview_rows(display: &mut Oled128x128, src: &[u32], mode: &UvcMode, first_row: usize, n: usize) {
+    const BAYER: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+    let (step, x0, y0, rows) = preview_geometry(mode);
+    let words_per_row = mode.width * 2 / core::mem::size_of::<u32>();
+    for r in 0..n {
+        let img_row = first_row + r;
+        if img_row < y0 || (img_row - y0) % step != 0 {
+            continue;
+        }
+        let py = (img_row - y0) / step;
+        if py >= rows {
+            continue;
+        }
+        let line = &src[r * words_per_row..][..words_per_row];
+        for px in 0..(mode.width / step).min(128) {
+            let x = x0 + px * step;
+            // luma is the high byte of each 16-bit pixel; two pixels per word
+            let word = line[x / 2];
+            let luma = if x & 1 == 0 { (word >> 8) & 0xff } else { (word >> 24) & 0xff } as u8;
+            let threshold = BAYER[py & 3][px & 3] * 16 + 8;
+            let on = luma > threshold;
+            unsafe {
+                display.put_pixel_unchecked(
+                    Point::new(px as isize, py as isize),
+                    if on { Mono::White.into() } else { Mono::Black.into() },
+                );
+            }
+        }
+    }
+}
+
+/// Status line under the preview: size, exposure mode, frame rate.
+#[cfg(feature = "uvc")]
+fn webcam_preview_status(
+    display: &mut Oled128x128,
+    mode: &UvcMode,
+    webcam: &WebcamState,
+    screen_size: Point,
+) {
+    let exp = match webcam.exposure_mode {
+        WebcamExposureMode::Auto => 'A',
+        WebcamExposureMode::Lock => 'L',
+        WebcamExposureMode::Manual { .. } => 'M',
+    };
+    let text =
+        format!("{}x{} {} {}.{}fps", mode.width, mode.height, exp, webcam.fps_x10 / 10, webcam.fps_x10 % 10);
+    gfx::msg(
+        display,
+        &text,
+        Point::new(0, PREVIEW_ROWS as isize),
+        Mono::White.into(),
+        Mono::Black.into(),
+        false,
+        screen_size,
+    );
 }
 
 /// Schedule a `WebcamWatchdog` check: if no frame has arrived by then, the camera is restarted.
@@ -634,6 +718,10 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
         if !is_panic.load(Ordering::Relaxed) {
             xous::reply_and_receive_next(sid, &mut msg_opt).unwrap();
             let msg = msg_opt.as_mut().unwrap();
+            #[cfg(feature = "uvc")]
+            let preview_owns_screen = webcam.active && webcam.preview;
+            #[cfg(not(feature = "uvc"))]
+            let preview_owns_screen = false;
             let opcode =
                 num_traits::FromPrimitive::from_usize(msg.body.id()).unwrap_or(GfxOpcode::InvalidCall);
             log::debug!("{:?}", opcode);
@@ -646,7 +734,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                         log::warn!("QR acquisition requested while webcam is active; refusing");
                         continue;
                     }
-                    if qr_request.is_none() {
+                    if qr_request.is_none() && !preview_owns_screen {
                         // decode dummy data - what this does is load the swapped out QR decoding logic, thus
                         // improving the latency of the decoder on the "first hit". The sole purpose of this
                         // is to improve the user experience during scanning.
@@ -920,9 +1008,25 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                     dst[r * dst_words..][..dst_words].copy_from_slice(src);
                                 }
                             }
+                            if webcam.preview {
+                                let src = unsafe { webcam.frame.as_slice::<u32>() };
+                                webcam_preview_rows(&mut display, src, &mode, band * mode.band_rows + row, n);
+                            }
                             let first = first_band && row == 0;
                             let last = last_band && row + n >= rows;
                             if row + n >= rows {
+                                if webcam.preview {
+                                    if last_band {
+                                        let now = tt.elapsed_ms();
+                                        let dt = now.saturating_sub(webcam.last_frame_ms).max(1);
+                                        webcam.fps_x10 = (10_000 / dt) as u32;
+                                        webcam.last_frame_ms = now;
+                                    }
+                                    webcam_preview_status(&mut display, &mode, &webcam, screen_size);
+                                    display.draw().unwrap_or_else(|_| {
+                                        display_timeout_handler(&udma_global, &mut display)
+                                    });
+                                }
                                 // the camera buffer is no longer needed: re-arm for the next band
                                 // (or the next frame) so it captures while this chunk goes out
                                 if last_band {
@@ -1297,6 +1401,19 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                         Some(sc) => (sc.arg1, sc.arg2, sc.arg3, sc.arg4),
                         None => (0, 0, 0, 0),
                     };
+                    if a1 == 6 {
+                        webcam.preview = a2 != 0;
+                        if !webcam.preview {
+                            display.clear();
+                            display
+                                .redraw()
+                                .unwrap_or_else(|_| display_timeout_handler(&udma_global, &mut display));
+                        }
+                        if let Some(scalar) = msg.body.scalar_message_mut() {
+                            scalar.arg1 = 1;
+                        }
+                        continue;
+                    }
                     if a1 == 4 {
                         // sensor clock divider for full-resolution modes (register 0xfa)
                         webcam.clkdiv_ratio1 = a2 as u8;
@@ -1472,7 +1589,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                     minigfx::handlers::draw_text_view(&mut display, msg);
                 }
                 GfxOpcode::Flush => {
-                    if qr_request.is_none() {
+                    if qr_request.is_none() && !preview_owns_screen {
                         log::trace!("***gfx flush*** redraw##");
                         if !dry_run {
                             display
@@ -1482,7 +1599,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                     }
                 }
                 GfxOpcode::Clear => {
-                    if qr_request.is_none() {
+                    if qr_request.is_none() && !preview_owns_screen {
                         display.clear();
                     }
                 }
@@ -1622,7 +1739,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                         } else {
                             orientation = DisplayOrientation::Normal;
                         }
-                        if qr_request.is_none() {
+                        if qr_request.is_none() && !preview_owns_screen {
                             display
                                 .flip_vertical(scalar.arg1 != 0)
                                 .unwrap_or_else(|_| display_timeout_handler(&udma_global, &mut display));

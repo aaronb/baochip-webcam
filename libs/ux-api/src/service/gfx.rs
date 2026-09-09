@@ -848,6 +848,12 @@ impl Gfx {
         }
     }
 
+    /// Show (or hide) the dithered camera preview on the badge's screen while the webcam runs.
+    #[cfg(feature = "board-baosec")]
+    pub fn webcam_preview(&self, on: bool) -> Result<(), xous::Error> {
+        self.webcam_tune(6, on as usize, 0, 0)
+    }
+
     /// Tuning knobs: `webcam_tune(4, div, 0, 0)` sets the sensor clock divider used for
     /// full-resolution modes; `webcam_tune(5, page, reg, val)` pokes a sensor register.
     #[cfg(feature = "board-baosec")]
