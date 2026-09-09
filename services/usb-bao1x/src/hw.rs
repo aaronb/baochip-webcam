@@ -358,6 +358,9 @@ pub(crate) fn composite_handler(_irq_no: usize, arg: *mut usize) {
                             ready.store(false, Ordering::SeqCst);
                         }
                         usb.wrapper.address_is_set.store(false, Ordering::SeqCst);
+                        // the transfer rings are re-initialized on a bus reset: nothing is in flight
+                        #[cfg(feature = "uvc")]
+                        usb.uvc.reset_state();
                     }
                 }
 

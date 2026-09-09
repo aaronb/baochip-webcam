@@ -34,6 +34,10 @@ impl Udma for Gc2145 {
 }
 
 impl Gc2145 {
+    /// Extra columns captured per line for `Resolution::Res160x120`, to be sliced off with
+    /// `set_slicing((LINE_PAD, 0), (width + LINE_PAD, height))`. Word-aligned (8 px = 16 bytes).
+    pub const LINE_PAD: usize = 8;
+
     #[cfg(feature = "std")]
     /// Safety: clocks must be turned on before this is called
     pub unsafe fn new() -> Result<Self, xous::Error> {
@@ -221,11 +225,26 @@ impl Gc2145 {
         // Sub-sampling ratio: 320x240 reads a 640x480 window at 1/2. 160x120 keeps the same
         // 640x480 window (same field of view) at 1/4 rather than zooming in on a 320x240 window.
         let ratio = match resolution {
-            Resolution::Res160x120 => 2u16,
+            Resolution::Res160x120 => 4u16,
             _ => 2u16,
         };
-        crate::println!("resolution set to {}x{} (subsample 1/{})", w, h, ratio);
-        self.set_resolution(i2c, w as u16, h as u16, ratio);
+        // Full-frame capture (no slicing) shows the first ~6 pixels of every line as dark:
+        // the line the DMA sees starts before the sensor's image data. Capture `LINE_PAD`
+        // extra columns and let the caller slice them off (see `Self::LINE_PAD`).
+        // Likewise the last captured line is unreliable: read one extra line and slice it off.
+        let (line_w, lines) = match resolution {
+            Resolution::Res160x120 => (w + Self::LINE_PAD, h + 1),
+            _ => (w, h),
+        };
+        crate::println!(
+            "resolution set to {}x{} (subsample 1/{}, capture {}x{})",
+            w,
+            h,
+            ratio,
+            line_w,
+            lines
+        );
+        self.set_resolution(i2c, line_w as u16, lines as u16, ratio);
         self.resolution = resolution;
 
         crate::println!("udma setup");
@@ -244,8 +263,7 @@ impl Gc2145 {
         // multiply by 1
         self.csr.wo(utra::udma_camera::REG_CAM_CFG_FILTER, 0x01_01_01);
 
-        let (x, _y) = resolution.into();
-        self.csr.wo(utra::udma_camera::REG_CAM_CFG_SIZE, (x as u32 - 1) << 16);
+        self.csr.wo(utra::udma_camera::REG_CAM_CFG_SIZE, (line_w as u32 - 1) << 16);
 
         let global = self.csr.ms(CFG_FRAMEDROP_EN, 0)
             | self.csr.ms(CFG_FORMAT, Format::BypassLe as u32)
@@ -260,6 +278,11 @@ impl Gc2145 {
     /// observed data. I don't know the underlying cause of it, but I suspect it probably has to
     /// do with data in the pipeline that's not flushed, so the first three elements are "stale"
     pub fn rx_buf<T: UdmaWidths>(&self) -> &[T] { &self.ifram.as_ref().unwrap().as_slice()[3..] }
+
+    /// The receive buffer from its very first element, without the "stale prefix" skip of
+    /// `rx_buf`. Measured on hardware for full-frame 160x120 capture (no slicing): the frame
+    /// starts at byte 0, and applying the skip rotates every row by 6 pixels.
+    pub fn rx_buf_unskipped<T: UdmaWidths>(&self) -> &[T] { self.ifram.as_ref().unwrap().as_slice() }
 
     /// TODO: figure out how to length-bound this to...the frame slice size? line size? idk...
     pub unsafe fn rx_buf_phys<T: UdmaWidths>(&self) -> &[T] { &self.ifram.as_ref().unwrap().as_phys_slice() }

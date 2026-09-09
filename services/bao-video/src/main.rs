@@ -279,7 +279,9 @@ fn webcam_start_capture(
     log::info!("webcam: camera pid {:x}, mid {:x}", pid, mid);
     cam.init(i2c, bao1x_api::camera::Resolution::Res160x120);
     tt.sleep_ms(15).ok();
-    cam.disable_slicing();
+    // drop the dark columns at the start of every line (see Gc2145::LINE_PAD)
+    let (w, h): (usize, usize) = bao1x_api::camera::Resolution::Res160x120.into();
+    cam.set_slicing((Gc2145::LINE_PAD, 0), (w + Gc2145::LINE_PAD, h));
     let (cols, rows) = cam.resolution();
     assert!(cols * rows * 2 == UVC_FRAME_BYTES, "camera frame size doesn't match the UVC frame size");
     cam.capture_async();
@@ -773,7 +775,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                         // then hand the copy to the USB service. That call blocks until the frame
                         // has gone out, or is discarded because the host isn't streaming.
                         {
-                            let fb: &[u32] = cam.rx_buf();
+                            let fb: &[u32] = cam.rx_buf_unskipped();
                             let words = UVC_FRAME_BYTES / core::mem::size_of::<u32>();
                             let dst = unsafe { webcam.frame.as_slice_mut::<u32>() };
                             dst[..words].copy_from_slice(&fb[..words]);

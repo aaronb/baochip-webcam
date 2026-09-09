@@ -246,12 +246,15 @@ impl<'a, B: UsbBus> UvcClass<'a, B> {
     }
 
     fn start_stream(&mut self) {
-        // abandon any frame in progress; a TD still in the hardware ring completes whenever the host
-        // next reads, and that completion must not advance the new frame's cursor.
+        // Abandon any frame in progress. A TD left in the hardware ring by a previous stream may
+        // still complete when the host reads again (then its completion is discarded), or may be
+        // gone entirely if the bus was reset in between. Either way, don't let it block the new
+        // stream: a discarded completion re-kicks, and at worst one payload is sent twice.
         self.cursor = 0;
         self.frame_active.store(false, Ordering::SeqCst);
         if self.in_flight {
             self.discard_completion = true;
+            self.in_flight = false;
         }
         self.streaming.store(true, Ordering::SeqCst);
         self.notify_stream_state(1);
