@@ -773,14 +773,18 @@ impl Gfx {
     /// stopped this way, regardless of the host opening and closing the video stream. Returns
     /// the resulting active state.
     #[cfg(feature = "board-baosec")]
-    pub fn webcam_control(&self, on: bool) -> Result<bool, xous::Error> {
+    pub fn webcam_control(&self, on: bool) -> Result<bool, xous::Error> { self.webcam_control_mode(on, 0) }
+
+    /// As `webcam_control`, selecting the video mode (index into the USB service's mode table).
+    #[cfg(feature = "board-baosec")]
+    pub fn webcam_control_mode(&self, on: bool, mode: usize) -> Result<bool, xous::Error> {
         match send_message(
             self.conn,
             Message::new_blocking_scalar(
                 GfxOpcode::WebcamControl.to_usize().unwrap(),
                 if on { 1 } else { 0 },
                 1,
-                0,
+                mode,
                 0,
             ),
         )? {
@@ -802,6 +806,55 @@ impl Gfx {
         match send_message(
             self.conn,
             Message::new_blocking_scalar(GfxOpcode::WebcamExposure.to_usize().unwrap(), a1, a2, a3, a4),
+        )? {
+            xous::Result::Scalar5(_, 1, _, _, _) => Ok(()),
+            _ => Err(xous::Error::InternalError),
+        }
+    }
+
+    /// Manual white balance gains R, G, B (4.4 fixed point, 0x40 = 1.0); disables auto white balance.
+    #[cfg(feature = "board-baosec")]
+    pub fn webcam_white_balance(&self, gains: [u8; 3]) -> Result<(), xous::Error> {
+        match send_message(
+            self.conn,
+            Message::new_blocking_scalar(
+                GfxOpcode::WebcamExposure.to_usize().unwrap(),
+                3,
+                gains[0] as usize,
+                gains[1] as usize,
+                gains[2] as usize,
+            ),
+        )? {
+            xous::Result::Scalar5(_, 1, _, _, _) => Ok(()),
+            _ => Err(xous::Error::InternalError),
+        }
+    }
+
+    /// Camera bring-up: start capture in an arbitrary geometry (not a host-selectable mode).
+    #[cfg(feature = "board-baosec")]
+    pub fn webcam_raw(&self, w: usize, h: usize, ratio: usize, pad: usize) -> Result<bool, xous::Error> {
+        match send_message(
+            self.conn,
+            Message::new_blocking_scalar(
+                GfxOpcode::WebcamControl.to_usize().unwrap(),
+                1,
+                2,
+                (w << 16) | (h & 0xffff),
+                (ratio << 8) | (pad & 0xff),
+            ),
+        )? {
+            xous::Result::Scalar5(_, active, _, _, _) => Ok(active != 0),
+            _ => Err(xous::Error::InternalError),
+        }
+    }
+
+    /// Tuning knobs: `webcam_tune(4, div, 0, 0)` sets the sensor clock divider used for
+    /// full-resolution modes; `webcam_tune(5, page, reg, val)` pokes a sensor register.
+    #[cfg(feature = "board-baosec")]
+    pub fn webcam_tune(&self, what: usize, a: usize, b: usize, c: usize) -> Result<(), xous::Error> {
+        match send_message(
+            self.conn,
+            Message::new_blocking_scalar(GfxOpcode::WebcamExposure.to_usize().unwrap(), what, a, b, c),
         )? {
             xous::Result::Scalar5(_, 1, _, _, _) => Ok(()),
             _ => Err(xous::Error::InternalError),

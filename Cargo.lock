@@ -7306,7 +7306,6 @@ dependencies = [
 [[package]]
 name = "usb-device"
 version = "0.2.8"
-source = "git+https://github.com/betrusted-io/usb-device.git?branch=main#7ab6ba8120f3d7b6e0904a7ef33e27e192617fe9"
 dependencies = [
  "log",
 ]

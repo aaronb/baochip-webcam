@@ -78,8 +78,9 @@ pub enum Opcode {
     #[cfg(feature = "uvc")]
     IrqUvcStreamChange = 771,
 
-    /// Lend a raw UYVY frame for transmission over UVC. The `valid` field carries the frame length
-    /// in, and a `UVC_RESULT_*` code out. Ignored (with an error reply) when built without `uvc`.
+    /// Lend a chunk of a raw UYVY frame for transmission over UVC. `valid` carries the chunk
+    /// length in and a `UVC_RESULT_*` code out; `offset` carries `UVC_CHUNK_*` flags and the
+    /// payload data size (see `UVC_CHUNK_FIRST`). Ignored (with an error reply) without `uvc`.
     UvcSendFrame = 1100,
     /// Register a server to be notified when the host starts (arg1 = 1) or stops (arg1 = 0) the
     /// video stream.
@@ -264,10 +265,87 @@ impl TryFrom<usize> for LogLevel {
 }
 
 // ---- UVC (USB video class) ----
-/// Frame geometry served over UVC. The frame buffer format is UYVY (2 bytes per pixel).
-pub const UVC_WIDTH: usize = 160;
-pub const UVC_HEIGHT: usize = 120;
-pub const UVC_FRAME_BYTES: usize = UVC_WIDTH * UVC_HEIGHT * 2;
+/// A video mode offered to the host: one UVC frame descriptor each. Pixel format is always
+/// UYVY (2 bytes per pixel). The sensor reads a centred `(width + line_pad) * ratio` by
+/// `(height + 1) * ratio` window and sub-samples it by `ratio`; the pad covers the 6-px stale
+/// prefix the camera DMA puts at the start of every line plus the sensor's dark dummy columns,
+/// and the extra line covers the unreliable last captured line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UvcMode {
+    pub width: usize,
+    pub height: usize,
+    /// sensor sub-sampling ratio; only even values are clean on the GC2145
+    pub ratio: u16,
+    /// extra columns captured per line
+    pub line_pad: usize,
+    /// frame interval advertised to the host, in 100 ns units
+    pub interval: u32,
+    /// image rows per UVC payload; payload data = rows * width * 2 bytes (at most 4800)
+    pub payload_rows: usize,
+    /// image rows captured per sensor frame (the whole image for the small mode, a band of
+    /// it for the large ones, limited by the camera's IFRAM); a multiple of `payload_rows`
+    pub band_rows: usize,
+}
+
+#[allow(dead_code)] // the library target only needs the table
+impl UvcMode {
+    pub const fn frame_bytes(&self) -> usize { self.width * self.height * 2 }
+
+    pub const fn payload_data(&self) -> usize { self.payload_rows * self.width * 2 }
+
+    /// Pixels per captured line: the padded width
+    pub const fn line_px(&self) -> usize { self.width + self.line_pad }
+
+    pub const fn bands(&self) -> usize { (self.height + self.band_rows - 1) / self.band_rows }
+}
+
+/// The modes, in UVC frame-descriptor order (bFrameIndex = index + 1). Index 0 is the default.
+pub const UVC_MODES: [UvcMode; 3] = [
+    // 640x480 sensor window (the QR scanner's), 1/4: the low-latency mode, ~24 fps achieved
+    UvcMode {
+        width: 160,
+        height: 120,
+        ratio: 4,
+        line_pad: 24,
+        interval: 666_666,
+        payload_rows: 15,
+        band_rows: 120,
+    },
+    // 1568x1152 window, 1/4: nearly the full field of view, 2 bands per frame
+    UvcMode {
+        width: 384,
+        height: 288,
+        ratio: 4,
+        line_pad: 8,
+        interval: 2_000_000,
+        payload_rows: 6,
+        band_rows: 144,
+    },
+    // 1556x1154 window, 1/2: 8 bands per frame
+    UvcMode {
+        width: 768,
+        height: 576,
+        ratio: 2,
+        line_pad: 10,
+        interval: 5_000_000,
+        payload_rows: 3,
+        band_rows: 72,
+    },
+    // A full-resolution (ratio 1) mode is deliberately absent: the sensor's ratio-1 output is
+    // not coherent through this camera DMA (see the note in Gc2145::init_window).
+];
+
+/// Largest payload data size across the modes; sets the staging slot size
+pub const UVC_MAX_PAYLOAD_DATA: usize = 4800;
+/// Frames are handed to the USB service in chunks of at most this many payloads
+pub const UVC_CHUNK_PAYLOADS: usize = 8;
+/// Largest chunk in bytes (fits a 10-page buffer)
+pub const UVC_CHUNK_MAX_BYTES: usize = UVC_CHUNK_PAYLOADS * UVC_MAX_PAYLOAD_DATA;
+
+/// Flags carried in the `offset` field of a `UvcSendFrame` lend, alongside the payload data
+/// size: `offset = flags | payload_data << 2`.
+pub const UVC_CHUNK_FIRST: usize = 1;
+pub const UVC_CHUNK_LAST: usize = 2;
 
 /// Result codes returned in the `valid` field of a `UvcSendFrame` lend
 pub const UVC_RESULT_SENT: usize = 1;

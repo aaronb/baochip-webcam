@@ -195,13 +195,13 @@ branch = "main" # c25519
 # path = "../curve25519-dalek/curve25519-dalek" # when doing local dev work
 # feature overrides are specified at the crate level
 
+# Vendored copy of the betrusted-io fork (branch main @ 7ab6ba8) plus a `control-buffer-512`
+# feature: the badge's composite configuration descriptor no longer fits 256 bytes.
 [patch.crates-io.usb-device]
-git = "https://github.com/betrusted-io/usb-device.git"
-branch = "main"
-# local dev shortcuts
-# path = "../usb-device"
-# [patch.github-io.usb-device]
-# path = "../usb-device"
+path = "imports/usb-device"
+
+[patch."https://github.com/betrusted-io/usb-device.git"]
+usb-device = { path = "imports/usb-device" }
 
 [patch.crates-io.getrandom]
 path = "imports/getrandom"

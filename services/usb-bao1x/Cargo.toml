@@ -35,7 +35,7 @@ riscv = { version = "0.5.6", package = "xous-riscv" }
 
 usb-device = { git = "https://github.com/betrusted-io/usb-device.git", branch = "main", features = [
     "log",
-    "control-buffer-256",
+    "control-buffer-512",
 ] }
 # usb-device = { path = "../../../usb-device", features = [
 #     "log",

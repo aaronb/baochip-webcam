@@ -39,6 +39,8 @@ pub struct Gc2145 {
     csr: CSR<u32>,
     ifram: Option<IframRange>,
     resolution: Resolution,
+    /// output size the sensor was configured for (before slicing)
+    dims: (usize, usize),
     slicing: Option<(usize, usize)>,
 }
 
@@ -91,6 +93,7 @@ impl Gc2145 {
             ifram: Some(ifram),
             // bogus value
             resolution: Resolution::Res160x120,
+            dims: (160, 120),
             slicing: None,
         }
     }
@@ -147,6 +150,17 @@ impl Gc2145 {
             self.poke(i2c, 0xb4, g);
             self.poke(i2c, 0xb5, bb);
         }
+    }
+
+    /// Manual white balance: AWB off, gains R, G, B in 4.4 fixed point (0x40 = 1.0).
+    pub fn set_awb_gains(&self, i2c: &mut dyn I2cApi, awb: [u8; 3]) {
+        self.poke(i2c, GC2145_REG_RESET, GC2145_SET_P0_REGS);
+        let mut b = [0u8; 1];
+        self.peek(i2c, 0x82, &mut b);
+        self.poke(i2c, 0x82, b[0] & !0x02);
+        self.poke(i2c, 0xb3, awb[0]);
+        self.poke(i2c, 0xb4, awb[1]);
+        self.poke(i2c, 0xb5, awb[2]);
     }
 
     /// Hand exposure and white balance back to the sensor's automatic engines.
@@ -264,8 +278,11 @@ impl Gc2145 {
         /* Set Sub-sampling ratio and mode */
         self.poke(i2c, GC2145_REG_SUBSAMPLE, ((r_ratio << 4) | c_ratio) as u8);
 
-        // set to nearest-neighbor averaging plus "use" mode
-        self.poke(i2c, GC2145_REG_SUBSAMPLE_MODE, 0x32);
+        // Sub-sample mode: nearest-neighbour averaging plus "use" mode for real sub-sampling.
+        // At ratio 1 that mode produces no frames at all (measured); the "smooth" mode the init
+        // table starts from works there.
+        let mode = if ratio == 1 { GC2145_SUBSAMPLE_MODE_SMOOTH } else { 0x32 };
+        self.poke(i2c, GC2145_REG_SUBSAMPLE_MODE, mode);
 
         self.delay(30);
 
@@ -276,6 +293,32 @@ impl Gc2145 {
 
     #[inline(never)]
     pub fn init(&mut self, i2c: &mut dyn I2cApi, resolution: Resolution) {
+        let (w, h) = resolution.into();
+        // Sub-sampling ratio: 320x240 reads a 640x480 window at 1/2. 160x120 keeps the same
+        // 640x480 window (same field of view) at 1/4 rather than zooming in on a 320x240 window.
+        // Only even ratios are clean on this sensor (odd ones scramble the Bayer phase).
+        let ratio = match resolution {
+            Resolution::Res160x120 => 4u16,
+            _ => 2u16,
+        };
+        // Full-frame capture (no slicing) shows the first ~6 pixels of every line as stale
+        // pipeline carry-over, the sensor's dummy columns come out dark, and the last captured
+        // line is unreliable. Capture `LINE_PAD` extra columns and one extra line and let the
+        // caller slice/skip them (see `Self::LINE_PAD`).
+        let (line_w, lines) = match resolution {
+            Resolution::Res160x120 => (w + Self::LINE_PAD, h + 1),
+            _ => (w, h),
+        };
+        self.init_window(i2c, line_w as u16, lines as u16, ratio);
+        self.resolution = resolution;
+    }
+
+    /// Reset and configure the sensor to output a `window_w` x `window_h` image, produced by
+    /// reading a centred `window_w * ratio` x `window_h * ratio` region of the sensor and
+    /// sub-sampling it by `ratio` (even values only). Also configures the camera DMA for that
+    /// line length. `resolution()` reports `window_w` x `window_h` until slicing is set.
+    #[inline(never)]
+    pub fn init_window(&mut self, i2c: &mut dyn I2cApi, window_w: u16, window_h: u16, ratio: u16) {
         // initiate a reset
         self.poke(i2c, GC2145_REG_RESET, GC2145_REG_SW_RESET);
         self.delay(300); // wait for reset
@@ -302,39 +345,19 @@ impl Gc2145 {
         );
         self.delay(30);
 
-        let (w, h) = resolution.into();
-        // Sub-sampling ratio: 320x240 reads a 640x480 window at 1/2. 160x120 keeps the same
-        // 640x480 window (same field of view) at 1/4 rather than zooming in on a 320x240 window.
-        let ratio = match resolution {
-            Resolution::Res160x120 => 4u16,
-            _ => 2u16,
-        };
-        // Full-frame capture (no slicing) shows the first ~6 pixels of every line as dark:
-        // the line the DMA sees starts before the sensor's image data. Capture `LINE_PAD`
-        // extra columns and let the caller slice them off (see `Self::LINE_PAD`).
-        // Likewise the last captured line is unreliable: read one extra line and slice it off.
-        let (line_w, lines) = match resolution {
-            Resolution::Res160x120 => (w + Self::LINE_PAD, h + 1),
-            _ => (w, h),
-        };
-        crate::println!(
-            "resolution set to {}x{} (subsample 1/{}, capture {}x{})",
-            w,
-            h,
-            ratio,
-            line_w,
-            lines
-        );
-        self.set_resolution(i2c, line_w as u16, lines as u16, ratio);
-        self.resolution = resolution;
+        crate::println!("camera window {}x{} (subsample 1/{})", window_w, window_h, ratio);
+        self.set_resolution(i2c, window_w, window_h, ratio);
+        // NOTE: ratio 1 (no sub-sampling) does not produce a coherent image on this board: rows
+        // arrive misaligned with the line length whatever the crop, readout window, PLL or
+        // clock divider settings (measured 2026-09-09). Even ratios 2 and 4 are fine.
+        let dma_w = window_w as usize;
+        self.dims = (dma_w, window_h as usize);
+        self.slicing = None;
 
         crate::println!("udma setup");
         // set sync polarity
         let vsync_pol = 0;
-        let hsync_pol = match resolution {
-            Resolution::Res320x240 => 0,
-            _ => 0,
-        };
+        let hsync_pol = 0;
         self.csr.wo(
             utra::udma_camera::REG_CAM_VSYNC_POLARITY,
             self.csr.ms(utra::udma_camera::REG_CAM_VSYNC_POLARITY_R_CAM_VSYNC_POLARITY, vsync_pol)
@@ -344,7 +367,7 @@ impl Gc2145 {
         // multiply by 1
         self.csr.wo(utra::udma_camera::REG_CAM_CFG_FILTER, 0x01_01_01);
 
-        self.csr.wo(utra::udma_camera::REG_CAM_CFG_SIZE, (line_w as u32 - 1) << 16);
+        self.csr.wo(utra::udma_camera::REG_CAM_CFG_SIZE, (dma_w as u32 - 1) << 16);
 
         let global = self.csr.ms(CFG_FRAMEDROP_EN, 0)
             | self.csr.ms(CFG_FORMAT, Format::BypassLe as u32)
@@ -388,7 +411,7 @@ impl Gc2145 {
     }
 
     pub fn resolution(&self) -> (usize, usize) {
-        if let Some((x, y)) = self.slicing { (x, y) } else { self.resolution.into() }
+        if let Some((x, y)) = self.slicing { (x, y) } else { self.dims }
     }
 
     pub fn set_slicing(&mut self, ll: (usize, usize), ur: (usize, usize)) {

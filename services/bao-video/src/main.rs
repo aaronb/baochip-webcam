@@ -45,7 +45,9 @@ use bao1x_hal_service::UdmaGlobal;
 use base64::{Engine as _, engine::general_purpose};
 use num_traits::*;
 #[cfg(feature = "uvc")]
-use usb_bao1x::{UVC_FRAME_BYTES, UvcFrameResult};
+use usb_bao1x::UvcMode;
+#[cfg(feature = "uvc")]
+use usb_bao1x::{UVC_CHUNK_PAYLOADS, UVC_MODES, UvcFrameResult};
 #[cfg(not(feature = "hosted-baosec"))]
 use utralib::utra;
 use ux_api::minigfx::{self, FrameBuffer};
@@ -208,6 +210,23 @@ struct WebcamState {
     restarts: usize,
     /// words to skip at the start of every captured line (the stale pipeline prefix)
     crop_words: usize,
+    /// index into `UVC_MODES` of the mode being captured
+    mode: usize,
+    /// a console-defined geometry for camera bring-up, used instead of `UVC_MODES[mode]` when set
+    custom: Option<UvcMode>,
+    /// band (group of rows captured per sensor frame) being captured
+    band: usize,
+    /// sensor frames to discard before the next frame starts, so that auto-exposure can adapt
+    /// between banded frames while being locked within one
+    settle: usize,
+    /// exposure was locked by the banded-capture logic (not by the user) for the current frame
+    frame_locked: bool,
+    /// sensor clock divider register (0xfa) to apply for ratio-1 geometries (bring-up knob)
+    clkdiv_ratio1: u8,
+    /// The first capture session after boot shows a 6-px stale band somewhere in every line
+    /// (measured: only the first DMA run after a cold boot, never the sessions after it). The
+    /// first session therefore restarts itself after a few frames.
+    first_session: bool,
     /// started from the console: the host's stream stop must not switch the camera off
     pinned: bool,
     /// requested exposure handling; persists across sessions
@@ -221,7 +240,7 @@ struct WebcamState {
 #[cfg(feature = "uvc")]
 impl WebcamState {
     fn new() -> Self {
-        let pages = (UVC_FRAME_BYTES + 4095) / 4096;
+        let pages = (usb_bao1x::UVC_CHUNK_MAX_BYTES + 4095) / 4096;
         let frame = xous::map_memory(None, None, pages * 4096, xous::MemoryFlags::R | xous::MemoryFlags::W)
             .expect("couldn't allocate webcam frame buffer");
         WebcamState {
@@ -232,6 +251,13 @@ impl WebcamState {
             dropped: 0,
             restarts: 0,
             crop_words: 3,
+            mode: 0,
+            custom: None,
+            band: 0,
+            settle: 0,
+            frame_locked: false,
+            clkdiv_ratio1: 0x19,
+            first_session: true,
             pinned: false,
             exposure_mode: WebcamExposureMode::Auto,
             exposure_applied: false,
@@ -294,18 +320,18 @@ fn webcam_start_capture(
     cam_pdwn: (IoxPort, u8),
     tt: &ticktimer::Ticktimer,
     udma_global: &UdmaGlobal,
+    mode: &UvcMode,
+    clkdiv_ratio1: u8,
 ) {
     udma_global.reset(PeriphId::Cam);
     camera_power_up(iox, timer, cam_clk, cam_pdwn, tt);
     let (pid, mid) = cam.read_id(i2c);
     log::info!("webcam: camera pid {:x}, mid {:x}", pid, mid);
-    cam.init(i2c, bao1x_api::camera::Resolution::Res160x120);
+    // The sensor outputs the padded line width and one extra line; the DMA slicer picks the
+    // band of rows for each sensor frame (see `webcam_slice_band`), and the frame copy drops
+    // the 3 stale words at the start of every line (see the CamIrq handler).
+    cam.init_window(i2c, mode.line_px() as u16, (mode.height + 1) as u16, mode.ratio);
     tt.sleep_ms(15).ok();
-    // Capture the padded line from column 0 and take rows 0..h. The first 3 words of every
-    // captured line are pipeline carry-over from the previous line (measured: they correlate
-    // with its last 6 pixels), so the frame copy drops them; see the CamIrq handler.
-    let (w, h): (usize, usize) = bao1x_api::camera::Resolution::Res160x120.into();
-    cam.set_slicing((0, 0), (w + Gc2145::LINE_PAD, h));
     // The init table enables the sensor's horizontal mirror (P0 reg 0x17 bit 0, reads 0x15),
     // which is right for the badge's own display but mirrors the webcam picture. Clear it.
     {
@@ -314,12 +340,23 @@ fn webcam_start_capture(
         cam.peek(i2c, 0x17, &mut v);
         cam.poke(i2c, 0x17, v[0] & !0x01);
     }
-    let (cols, rows) = cam.resolution();
-    assert!(
-        (cols - Gc2145::LINE_PAD) * rows * 2 == UVC_FRAME_BYTES,
-        "camera frame size doesn't match the UVC frame size"
-    );
+    if mode.ratio == 1 {
+        cam.poke(i2c, 0xfe, 0x00);
+        cam.poke(i2c, 0xfa, clkdiv_ratio1);
+    }
+    webcam_slice_band(cam, mode, 0);
     cam.capture_async();
+}
+
+/// Point the DMA slicer at band `band` of the mode's image: `band_rows` rows (fewer for the last
+/// band) plus one extra, unreliable, row that the copy ignores. Returns the number of image rows
+/// in the band.
+#[cfg(feature = "uvc")]
+fn webcam_slice_band(cam: &mut Gc2145, mode: &UvcMode, band: usize) -> usize {
+    let y0 = band * mode.band_rows;
+    let rows = mode.band_rows.min(mode.height - y0);
+    cam.set_slicing((0, y0), (mode.line_px(), y0 + rows + 1));
+    rows
 }
 
 /// Schedule a `WebcamWatchdog` check: if no frame has arrived by then, the camera is restarted.
@@ -805,49 +842,129 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                 GfxOpcode::CamIrq => {
                     #[cfg(feature = "uvc")]
                     if webcam.active {
-                        // Copy the frame out of the camera IFRAM as words (it is uncached and slow to
-                        // read), re-arm the capture so the next frame lands while this one is sent,
-                        // then hand the copy to the USB service. That call blocks until the frame
-                        // has gone out, or is discarded because the host isn't streaming.
-                        {
-                            // Each captured line is LINE_PAD pixels wider than the image. Its
-                            // first 3 words (6 px) are stale (pipeline carry-over) and the
-                            // sensor's last few columns are dark, so take one image width
-                            // starting at word 3 of every line.
-                            let fb: &[u32] = cam.rx_buf_unskipped();
-                            let dst = unsafe { webcam.frame.as_slice_mut::<u32>() };
-                            let (w, h): (usize, usize) = bao1x_api::camera::Resolution::Res160x120.into();
-                            let src_words = (w + Gc2145::LINE_PAD) * 2 / core::mem::size_of::<u32>();
-                            let dst_words = w * 2 / core::mem::size_of::<u32>();
-                            let crop = webcam.crop_words.min(src_words - dst_words);
-                            for row in 0..h {
-                                let src = &fb[row * src_words + crop..][..dst_words];
-                                dst[row * dst_words..][..dst_words].copy_from_slice(src);
-                            }
-                        }
+                        // One sensor frame has landed: the whole image for the small mode, or one
+                        // band of it for the large ones. Copy it out of the camera IFRAM (uncached,
+                        // slow to read) in chunks, hand each chunk to the USB service, and re-arm
+                        // the capture for the next band or frame. The USB call blocks until the
+                        // chunk has gone out, or is discarded because the host isn't streaming.
+                        let mode = webcam.custom.unwrap_or(UVC_MODES[webcam.mode]);
+                        let bands = mode.bands();
+                        let band = webcam.band;
+                        let first_band = band == 0;
+                        let last_band = band + 1 == bands;
+                        let rows = mode.band_rows.min(mode.height - band * mode.band_rows);
                         webcam.captured += 1;
-                        // Lock waits for the automatic engines to settle on the scene first
-                        // (about 20 frames); manual settings are applied at start.
-                        if !webcam.exposure_applied
-                            && webcam.exposure_mode == WebcamExposureMode::Lock
-                            && webcam.captured >= 20
-                        {
-                            webcam.exposure = cam.lock_exposure(&mut i2c);
-                            webcam.exposure_applied = true;
-                            log::info!("webcam: exposure locked at {:?}", webcam.exposure);
+
+                        if webcam.settle > 0 {
+                            // discarding sensor frames so auto-exposure can adapt between frames
+                            webcam.settle -= 1;
+                            cam.capture_async();
+                            continue;
                         }
-                        cam.capture_async();
-                        match usb.uvc_send_frame(webcam.frame, UVC_FRAME_BYTES) {
-                            Ok(UvcFrameResult::Sent) => webcam.sent += 1,
-                            Ok(UvcFrameResult::NotStreaming) => webcam.dropped += 1,
-                            Ok(other) => {
-                                log::warn!("UVC frame refused: {:?}", other);
-                                webcam.dropped += 1;
+                        if webcam.first_session && webcam.captured >= 4 {
+                            // see `first_session`: restart the camera once, then carry on
+                            webcam.first_session = false;
+                            log::info!("webcam: restarting the first session after boot");
+                            camera_power_down(&iox, &mut timer, cam_clk, cam_pdwn, &tt);
+                            webcam.band = 0;
+                            webcam.frame_locked = false;
+                            webcam.exposure_applied = false;
+                            let m = webcam.custom.unwrap_or(UVC_MODES[webcam.mode]);
+                            webcam_start_capture(
+                                &mut cam,
+                                &mut i2c,
+                                &iox,
+                                &mut timer,
+                                cam_clk,
+                                cam_pdwn,
+                                &tt,
+                                &udma_global,
+                                &m,
+                                webcam.clkdiv_ratio1,
+                            );
+                            continue;
+                        }
+                        if first_band {
+                            // User lock: wait for the automatic engines to settle (about 20
+                            // frames); manual settings are applied at start.
+                            if !webcam.exposure_applied
+                                && webcam.exposure_mode == WebcamExposureMode::Lock
+                                && webcam.captured >= 20
+                            {
+                                webcam.exposure = cam.lock_exposure(&mut i2c);
+                                webcam.exposure_applied = true;
+                                log::info!("webcam: exposure locked at {:?}", webcam.exposure);
                             }
-                            Err(e) => {
-                                log::error!("UVC frame send failed: {:?}", e);
-                                webcam.dropped += 1;
+                            // Banded frames: hold exposure and white balance for the whole frame
+                            // so the bands match, unless the user already fixed them.
+                            if bands > 1 && webcam.exposure_mode == WebcamExposureMode::Auto {
+                                webcam.exposure = cam.lock_exposure(&mut i2c);
+                                webcam.frame_locked = true;
                             }
+                        }
+
+                        let src_words = mode.line_px() * 2 / core::mem::size_of::<u32>();
+                        let dst_words = mode.width * 2 / core::mem::size_of::<u32>();
+                        let crop = webcam.crop_words.min(src_words - dst_words);
+                        let chunk_rows = UVC_CHUNK_PAYLOADS * mode.payload_rows;
+                        let mut row = 0;
+                        while row < rows {
+                            let n = chunk_rows.min(rows - row);
+                            {
+                                // borrow the camera buffer only for the copy: the re-arm below
+                                // needs the camera mutably
+                                let fb: &[u32] = cam.rx_buf_unskipped();
+                                let dst = unsafe { webcam.frame.as_slice_mut::<u32>() };
+                                for r in 0..n {
+                                    let src = &fb[(row + r) * src_words + crop..][..dst_words];
+                                    dst[r * dst_words..][..dst_words].copy_from_slice(src);
+                                }
+                            }
+                            let first = first_band && row == 0;
+                            let last = last_band && row + n >= rows;
+                            if row + n >= rows {
+                                // the camera buffer is no longer needed: re-arm for the next band
+                                // (or the next frame) so it captures while this chunk goes out
+                                if last_band {
+                                    if webcam.frame_locked {
+                                        cam.unlock_exposure(&mut i2c);
+                                        webcam.frame_locked = false;
+                                        webcam.settle = 2;
+                                    }
+                                    webcam.band = 0;
+                                } else {
+                                    webcam.band = band + 1;
+                                }
+                                webcam_slice_band(&mut cam, &mode, webcam.band);
+                                cam.capture_async();
+                            }
+                            match usb.uvc_send_chunk(
+                                webcam.frame,
+                                n * mode.width * 2,
+                                mode.payload_data(),
+                                first,
+                                last,
+                            ) {
+                                Ok(UvcFrameResult::Sent) => {
+                                    if last {
+                                        webcam.sent += 1;
+                                    }
+                                }
+                                Ok(UvcFrameResult::NotStreaming) => {
+                                    if last {
+                                        webcam.dropped += 1;
+                                    }
+                                }
+                                Ok(other) => {
+                                    log::warn!("UVC chunk refused: {:?}", other);
+                                    webcam.dropped += 1;
+                                }
+                                Err(e) => {
+                                    log::error!("UVC chunk send failed: {:?}", e);
+                                    webcam.dropped += 1;
+                                }
+                            }
+                            row += n;
                         }
                         continue;
                     }
@@ -1033,14 +1150,46 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                 }
                 #[cfg(feature = "uvc")]
                 GfxOpcode::WebcamControl => {
-                    let (on, from_console) = msg
+                    let (on, source, arg3, arg4) = msg
                         .body
                         .scalar_message()
-                        .map(|s| (s.arg1 != 0, s.arg2 != 0))
-                        .unwrap_or((false, false));
+                        .map(|s| (s.arg1 != 0, s.arg2, s.arg3, s.arg4))
+                        .unwrap_or((false, 0, 0, 0));
+                    let from_console = source != 0;
+                    let raw = if source == 2 {
+                        // console bring-up geometry: arg3 = w << 16 | h, arg4 = ratio << 8 | pad
+                        let (w, h) = (arg3 >> 16, arg3 & 0xffff);
+                        let (ratio, pad) = ((arg4 >> 8) as u16, arg4 & 0xff);
+                        let payload_rows = (4800 / (w * 2)).max(1);
+                        let per_band = 122_880 / ((w + pad) * 2) - 1;
+                        let band_rows =
+                            (per_band / payload_rows * payload_rows).clamp(payload_rows, h.max(payload_rows));
+                        Some(UvcMode {
+                            width: w,
+                            height: h,
+                            ratio,
+                            line_pad: pad,
+                            interval: 10_000_000,
+                            payload_rows,
+                            band_rows,
+                        })
+                    } else {
+                        None
+                    };
+                    let mode = if raw.is_some() { 0 } else { arg3.min(UVC_MODES.len() - 1) };
                     if on {
                         if from_console {
                             webcam.pinned = true;
+                        }
+                        if raw.is_some() && webcam.active {
+                            camera_power_down(&iox, &mut timer, cam_clk, cam_pdwn, &tt);
+                            webcam.active = false;
+                        }
+                        if webcam.active && webcam.mode != mode && !from_console {
+                            // the host committed a different size: restart the camera in it
+                            log::info!("webcam: switching mode {} -> {}", webcam.mode, mode);
+                            camera_power_down(&iox, &mut timer, cam_clk, cam_pdwn, &tt);
+                            webcam.active = false;
                         }
                         if webcam.active {
                             log::debug!("webcam already active");
@@ -1048,10 +1197,19 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                             log::warn!("webcam start refused: QR acquisition in progress");
                         } else {
                             webcam.active = true;
+                            webcam.mode = mode;
+                            webcam.custom = raw;
+                            if let Some(m) = raw {
+                                log::info!("webcam: raw geometry {:?}", m);
+                            }
+                            webcam.band = 0;
+                            webcam.settle = 0;
+                            webcam.frame_locked = false;
                             webcam.captured = 0;
                             webcam.sent = 0;
                             webcam.dropped = 0;
                             webcam.restarts = 0;
+                            let m = webcam.custom.unwrap_or(UVC_MODES[mode]);
                             webcam_start_capture(
                                 &mut cam,
                                 &mut i2c,
@@ -1061,6 +1219,8 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                 cam_pdwn,
                                 &tt,
                                 &udma_global,
+                                &m,
+                                webcam.clkdiv_ratio1,
                             );
                             webcam.exposure_applied = false;
                             if let WebcamExposureMode::Manual { exposure, pregain, postgain } =
@@ -1077,6 +1237,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                         log::debug!("webcam: host stream stopped; camera stays on (pinned by console)");
                     } else if webcam.active {
                         webcam.pinned = false;
+                        webcam.custom = None;
                         webcam.active = false;
                         camera_power_down(&iox, &mut timer, cam_clk, cam_pdwn, &tt);
                         log::info!(
@@ -1104,6 +1265,10 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                     RESTART_LIMIT
                                 );
                                 camera_power_down(&iox, &mut timer, cam_clk, cam_pdwn, &tt);
+                                webcam.band = 0;
+                                webcam.settle = 0;
+                                webcam.frame_locked = false;
+                                let m = webcam.custom.unwrap_or(UVC_MODES[webcam.mode]);
                                 webcam_start_capture(
                                     &mut cam,
                                     &mut i2c,
@@ -1113,6 +1278,8 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                     cam_pdwn,
                                     &tt,
                                     &udma_global,
+                                    &m,
+                                    webcam.clkdiv_ratio1,
                                 );
                                 webcam_arm_watchdog(cid, webcam.captured, &tt);
                             } else {
@@ -1130,6 +1297,53 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                         Some(sc) => (sc.arg1, sc.arg2, sc.arg3, sc.arg4),
                         None => (0, 0, 0, 0),
                     };
+                    if a1 == 4 {
+                        // sensor clock divider for full-resolution modes (register 0xfa)
+                        webcam.clkdiv_ratio1 = a2 as u8;
+                        if webcam.active && webcam.custom.unwrap_or(UVC_MODES[webcam.mode]).ratio == 1 {
+                            cam.poke(&mut i2c, 0xfe, 0x00);
+                            cam.poke(&mut i2c, 0xfa, webcam.clkdiv_ratio1);
+                        }
+                        log::info!("webcam: ratio-1 clock divider 0x{:02x}", webcam.clkdiv_ratio1);
+                        if let Some(scalar) = msg.body.scalar_message_mut() {
+                            scalar.arg1 = 1;
+                        }
+                        continue;
+                    }
+                    if a1 == 5 {
+                        // raw sensor register poke: page, register, value
+                        if webcam.active {
+                            cam.poke(&mut i2c, 0xfe, a2 as u8);
+                            cam.poke(&mut i2c, a3 as u8, a4 as u8);
+                            let mut v = [0u8; 1];
+                            cam.peek(&mut i2c, a3 as u8, &mut v);
+                            log::info!(
+                                "webcam: poke p{} 0x{:02x} <- 0x{:02x} (reads 0x{:02x})",
+                                a2,
+                                a3,
+                                a4,
+                                v[0]
+                            );
+                            cam.poke(&mut i2c, 0xfe, 0x00);
+                        }
+                        if let Some(scalar) = msg.body.scalar_message_mut() {
+                            scalar.arg1 = if webcam.active { 1 } else { 0 };
+                        }
+                        continue;
+                    }
+                    if a1 == 3 {
+                        // white balance gains only (R, G, B in 4.4 fixed point); leaves the
+                        // exposure mode alone
+                        if webcam.active {
+                            cam.set_awb_gains(&mut i2c, [a2 as u8, a3 as u8, a4 as u8]);
+                            webcam.exposure = cam.read_exposure(&mut i2c);
+                            log::info!("webcam: white balance -> {:?}", webcam.exposure);
+                        }
+                        if let Some(scalar) = msg.body.scalar_message_mut() {
+                            scalar.arg1 = 1;
+                        }
+                        continue;
+                    }
                     webcam.exposure_mode = match a1 {
                         1 => WebcamExposureMode::Lock,
                         2 => WebcamExposureMode::Manual {

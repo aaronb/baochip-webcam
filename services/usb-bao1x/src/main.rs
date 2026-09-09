@@ -930,8 +930,10 @@ pub(crate) fn main_hw() -> ! {
                         uvc_pending = msg_opt.take();
                     }
                 } else if let Some(staging) = uvc_staging.as_mut() {
-                    if uvc_stage_frame(msg, staging.as_slice_mut::<u8>(), &mut uvc_fid) {
-                        cu.uvc.set_frame_active();
+                    if let Some((n, len, last, eof)) =
+                        uvc_stage_chunk(msg, staging.as_slice_mut::<u8>(), &mut uvc_fid)
+                    {
+                        cu.uvc.set_chunk(n, len, last, eof);
                         cu.sw_irq(UsbIrqReq::UvcKick);
                     }
                 }
@@ -941,8 +943,10 @@ pub(crate) fn main_hw() -> ! {
                 if let Some(mut env) = uvc_pending.take() {
                     match uvc_staging.as_mut() {
                         Some(staging) if cu.uvc.is_streaming() && !cu.uvc.frame_busy() => {
-                            if uvc_stage_frame(&mut env, staging.as_slice_mut::<u8>(), &mut uvc_fid) {
-                                cu.uvc.set_frame_active();
+                            if let Some((n, len, last, eof)) =
+                                uvc_stage_chunk(&mut env, staging.as_slice_mut::<u8>(), &mut uvc_fid)
+                            {
+                                cu.uvc.set_chunk(n, len, last, eof);
                                 cu.sw_irq(UsbIrqReq::UvcKick);
                             }
                         }
@@ -956,15 +960,17 @@ pub(crate) fn main_hw() -> ! {
                 }
             }
             #[cfg(feature = "uvc")]
-            Opcode::IrqUvcStreamChange => msg_scalar_unpack!(msg, state, _, _, _, {
-                log::info!("UVC stream {}", if state != 0 { "started" } else { "stopped" });
+            Opcode::IrqUvcStreamChange => msg_scalar_unpack!(msg, state, mode, _, _, {
+                log::info!("UVC stream {} (mode {})", if state != 0 { "started" } else { "stopped" }, mode);
                 if let Some(mut env) = uvc_pending.take() {
                     // any frame in progress was abandoned by the state change; the staging buffer
                     // is free again.
                     match uvc_staging.as_mut() {
                         Some(staging) if state != 0 && cu.uvc.is_streaming() && !cu.uvc.frame_busy() => {
-                            if uvc_stage_frame(&mut env, staging.as_slice_mut::<u8>(), &mut uvc_fid) {
-                                cu.uvc.set_frame_active();
+                            if let Some((n, len, last, eof)) =
+                                uvc_stage_chunk(&mut env, staging.as_slice_mut::<u8>(), &mut uvc_fid)
+                            {
+                                cu.uvc.set_chunk(n, len, last, eof);
                                 cu.sw_irq(UsbIrqReq::UvcKick);
                             }
                         }
@@ -976,7 +982,8 @@ pub(crate) fn main_hw() -> ! {
                     }
                 }
                 if let Some((cid, op)) = uvc_observer {
-                    xous::try_send_message(cid, xous::Message::new_scalar(op, state, 0, 0, 0)).ok();
+                    // arg2 = 0: from the USB service (not the console); arg3 = mode index
+                    xous::try_send_message(cid, xous::Message::new_scalar(op, state, 0, mode, 0)).ok();
                 }
             }),
             Opcode::UvcStatus => {
@@ -1043,22 +1050,35 @@ pub(crate) fn main_hw() -> ! {
     xous::terminate_process(0)
 }
 
-/// Copy the frame carried by a `UvcSendFrame` lend into the IFRAM staging buffer and set the
-/// reply code. Returns true if a frame was staged.
+/// Copy the chunk carried by a `UvcSendFrame` lend into the IFRAM staging buffer and set the
+/// reply code. Returns the chunk description for `UvcClass::set_chunk` if a chunk was staged.
 #[cfg(all(target_os = "xous", feature = "uvc"))]
-fn uvc_stage_frame(env: &mut xous::MessageEnvelope, staging: &mut [u8], fid: &mut u8) -> bool {
-    let Some(mem) = env.body.memory_message_mut() else {
-        return false;
-    };
+fn uvc_stage_chunk(
+    env: &mut xous::MessageEnvelope,
+    staging: &mut [u8],
+    fid: &mut u8,
+) -> Option<(usize, usize, usize, bool)> {
+    let mem = env.body.memory_message_mut()?;
     let len = mem.valid.map(|v| v.get()).unwrap_or(0);
-    let frame = unsafe { mem.buf.as_slice::<u8>() };
-    if len < api::UVC_FRAME_BYTES || frame.len() < api::UVC_FRAME_BYTES {
-        log::warn!("UVC: short frame offered ({} valid, {} buffer)", len, frame.len());
+    let info = mem.offset.map(|v| v.get()).unwrap_or(0);
+    let first = info & api::UVC_CHUNK_FIRST != 0;
+    let last = info & api::UVC_CHUNK_LAST != 0;
+    let payload_data = info >> 2;
+    let data = unsafe { mem.buf.as_slice::<u8>() };
+    if len == 0
+        || len > data.len()
+        || len > api::UVC_CHUNK_MAX_BYTES
+        || payload_data == 0
+        || payload_data > api::UVC_MAX_PAYLOAD_DATA
+    {
+        log::warn!("UVC: bad chunk offered ({} bytes, payload {}, buffer {})", len, payload_data, data.len());
         mem.valid = xous::MemorySize::new(api::UVC_RESULT_BAD_FRAME);
-        return false;
+        return None;
     }
-    crate::uvc::stage_frame(staging, &frame[..api::UVC_FRAME_BYTES], *fid);
-    *fid ^= 1;
+    if first {
+        *fid ^= 1;
+    }
+    let (n, plen, last_len) = crate::uvc::stage_chunk(staging, &data[..len], payload_data, *fid, last);
     mem.valid = xous::MemorySize::new(api::UVC_RESULT_SENT);
-    true
+    Some((n, plen, last_len, last))
 }

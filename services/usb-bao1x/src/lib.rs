@@ -352,23 +352,29 @@ impl UsbHid {
             .expect("couldn't register listener");
     }
 
-    /// Lend a raw UYVY frame of `UVC_FRAME_BYTES` bytes to the USB service for transmission over
-    /// the UVC bulk endpoint. `frame` must be a page-aligned, page-sized mapping (as returned by
-    /// `xous::map_memory`). Blocks until the frame has been transmitted, or discarded because the
-    /// host is not streaming.
-    pub fn uvc_send_frame(
+    /// Lend a chunk of a raw UYVY frame (`len` bytes, a whole number of payloads of
+    /// `payload_data` bytes except possibly the last chunk of a frame) to the USB service for
+    /// transmission over the UVC bulk endpoint. `first`/`last` mark the chunk that starts and
+    /// ends a frame; a single-chunk frame sets both. `buf` must be a page-aligned, page-sized
+    /// mapping (as returned by `xous::map_memory`). Blocks until the chunk has been
+    /// transmitted, or discarded because the host is not streaming.
+    pub fn uvc_send_chunk(
         &self,
-        frame: xous::MemoryRange,
+        buf: xous::MemoryRange,
         len: usize,
+        payload_data: usize,
+        first: bool,
+        last: bool,
     ) -> Result<UvcFrameResult, xous::Error> {
+        let flags = if first { UVC_CHUNK_FIRST } else { 0 } | if last { UVC_CHUNK_LAST } else { 0 };
         match send_message(
             self.conn,
             // a mutable lend: the service reports the result back in the `valid` field, and the
             // kernel only carries that back to the caller for mutable borrows
             Message::new_lend_mut(
                 Opcode::UvcSendFrame.to_usize().unwrap(),
-                frame,
-                None,
+                buf,
+                xous::MemoryAddress::new(flags | (payload_data << 2)),
                 xous::MemorySize::new(len),
             ),
         )? {

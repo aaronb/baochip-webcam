@@ -1,23 +1,27 @@
-//! Minimal USB Video Class (UVC 1.0) function: one uncompressed 160x120 UYVY format, streamed
+//! Minimal USB Video Class (UVC 1.0) function: uncompressed UYVY in a few fixed sizes, streamed
 //! over a bulk IN endpoint.
 //!
 //! Data path:
 //!
-//! 1. `bao-video` captures a frame and lends it to this service (`Opcode::UvcSendFrame`).
-//! 2. The main loop copies the frame into an IFRAM staging buffer laid out as `PAYLOADS_PER_FRAME` slots.
-//!    Each slot is a complete UVC payload: a 2-byte payload header followed by `PAYLOAD_DATA` bytes of image
-//!    (see `stage_frame`).
+//! 1. `bao-video` captures image data and lends it to this service in chunks of up to `UVC_CHUNK_PAYLOADS`
+//!    payloads (`Opcode::UvcSendFrame`). A chunk may be a whole frame (the small mode) or a part of one (the
+//!    large modes, whose frames are captured in bands over several sensor frames). Flags mark the chunk that
+//!    starts and the one that ends a frame.
+//! 2. The main loop copies the chunk into an IFRAM staging buffer laid out as payload slots, each a complete
+//!    UVC payload: a 2-byte header followed by the image bytes (see `stage_chunk`).
 //! 3. A software interrupt kicks the streamer. In interrupt context, one bulk transfer descriptor (TD) per
 //!    slot is enqueued; each completion chains the next slot. Every payload is shorter than a multiple of the
-//!    max packet size, so it terminates with a short packet, which is how the host delimits bulk payloads.
+//!    max packet size (or gets a zero-length packet appended), so it ends with a short packet, which is how
+//!    the host delimits bulk payloads.
 //!
-//! Stream lifecycle: the host negotiates with PROBE/COMMIT control requests; we answer every
-//! request with the single fixed configuration we support. COMMIT starts the stream. A
-//! CLEAR_FEATURE(ENDPOINT_HALT) on the streaming endpoint (what Linux and Windows send to stop a
-//! bulk video stream) or a bus reset stops it. State changes are reported to the main loop with
-//! `Opcode::IrqUvcStreamChange` so it can notify an observer (bao-video) to start or stop the camera.
+//! Stream lifecycle: the host negotiates with PROBE/COMMIT control requests. This core completes
+//! the data stage of those (OUT) requests in hardware without telling the stack, so the class
+//! learns about them from the SETUP packet the driver records (`poll`) and reads the host's
+//! proposal out of the EP0 buffer afterwards. COMMIT starts the stream; the observer (bao-video)
+//! is told which mode was chosen. A CLEAR_FEATURE(ENDPOINT_HALT) on the streaming endpoint (what
+//! Linux and Windows send to stop a bulk video stream) or a bus reset stops it.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bao1x_hal::usb::driver::{CRG_IN, CRG_INT_TARGET, CRG_XFER_AZP, CorigineUsb};
@@ -27,8 +31,7 @@ use usb_device::UsbDirection;
 use usb_device::class_prelude::*;
 use usb_device::control::{Recipient, Request, RequestType};
 
-use crate::api::Opcode;
-pub use crate::api::{UVC_FRAME_BYTES, UVC_HEIGHT, UVC_WIDTH};
+use crate::api::{Opcode, UVC_CHUNK_PAYLOADS, UVC_MAX_PAYLOAD_DATA, UVC_MODES, UvcMode};
 
 /// Endpoint number used for the video streaming bulk IN endpoint. This is assigned explicitly
 /// because the HAL's automatic endpoint allocator only handles the IN/OUT pair pattern used by the
@@ -37,25 +40,14 @@ pub use crate::api::{UVC_FRAME_BYTES, UVC_HEIGHT, UVC_WIDTH};
 pub const UVC_EP_NUM: usize = 4;
 /// High-speed bulk max packet size
 pub const UVC_MPS: u16 = 512;
-/// Frame interval in 100ns units: 15 fps
-pub const UVC_FRAME_INTERVAL: u32 = 666_666;
-/// Bits per second at the advertised frame rate
-const UVC_BIT_RATE: u32 = (UVC_FRAME_BYTES as u32) * 8 * 15;
 
-/// Image bytes per payload: 15 lines of UYVY
-pub const PAYLOAD_DATA: usize = UVC_WIDTH * 2 * 15;
 /// Payload header: bHeaderLength + bmHeaderInfo only (no PTS/SCR)
 pub const PAYLOAD_HDR: usize = 2;
-pub const PAYLOAD_LEN: usize = PAYLOAD_HDR + PAYLOAD_DATA;
-/// Distance between payload slots in the staging buffer; keeps every slot word-aligned
-pub const PAYLOAD_STRIDE: usize = (PAYLOAD_LEN + 3) & !3;
-pub const PAYLOADS_PER_FRAME: usize = UVC_FRAME_BYTES / PAYLOAD_DATA;
-/// Size of the IFRAM staging buffer needed to hold one fully framed image
-pub const STAGING_BYTES: usize = PAYLOADS_PER_FRAME * PAYLOAD_STRIDE;
+/// Distance between payload slots in the staging buffer; fits the largest payload, word-aligned
+pub const PAYLOAD_STRIDE: usize = (PAYLOAD_HDR + UVC_MAX_PAYLOAD_DATA + 3) & !3;
+/// Size of the IFRAM staging buffer: one chunk of payloads
+pub const STAGING_BYTES: usize = UVC_CHUNK_PAYLOADS * PAYLOAD_STRIDE;
 
-// sanity: payloads must divide the frame exactly, and must never be a whole number of packets
-// (a bulk payload is delimited by a short packet; the AZP flag handles the remaining case at runtime).
-const _: () = assert!(UVC_FRAME_BYTES % PAYLOAD_DATA == 0);
 const _: () = assert!(STAGING_BYTES <= 10 * 4096);
 
 // USB video class codes
@@ -121,6 +113,19 @@ const HDR_EOH: u8 = 0x80;
 const HDR_EOF: u8 = 0x02;
 const HDR_FID: u8 = 0x01;
 
+/// What the streamer is transmitting: one chunk of payloads staged by the main loop.
+#[derive(Clone, Copy, Default)]
+struct Chunk {
+    /// number of payload slots in use
+    payloads: usize,
+    /// byte length of each payload but the last (header included)
+    payload_len: usize,
+    /// byte length of the last payload (header included)
+    last_len: usize,
+    /// this chunk ends a frame
+    eof: bool,
+}
+
 pub struct UvcClass<'a, B: UsbBus> {
     vc_if: InterfaceNumber,
     vs_if: InterfaceNumber,
@@ -131,15 +136,23 @@ pub struct UvcClass<'a, B: UsbBus> {
     staging_phys: usize,
     /// host has committed a stream
     streaming: AtomicBool,
-    /// a staged frame is being transmitted; the staging buffer must not be touched
+    /// a staged chunk is being transmitted; the staging buffer must not be touched
     frame_active: AtomicBool,
+    /// completed frames (chunks with the end-of-frame flag)
     frames_sent: AtomicU32,
+    /// chunks transmitted
+    chunks_sent: AtomicU32,
+    /// mode index (0-based) the host selected with its last PROBE; used by COMMIT
+    selected: AtomicUsize,
+    /// a PROBE SET_CUR was seen and its data stage not yet inspected
+    probe_pending: bool,
     /// a TD is enqueued and its completion hasn't been seen yet
     in_flight: bool,
     /// the next completion belongs to a TD from a stream that has since been stopped
     discard_completion: bool,
     /// index of the payload slot currently in flight
     cursor: usize,
+    chunk: Chunk,
     pub dbg: DebugCounters,
 }
 
@@ -170,30 +183,15 @@ impl<'a, B: UsbBus> UvcClass<'a, B> {
             streaming: AtomicBool::new(false),
             frame_active: AtomicBool::new(false),
             frames_sent: AtomicU32::new(0),
+            chunks_sent: AtomicU32::new(0),
+            selected: AtomicUsize::new(0),
+            probe_pending: false,
             in_flight: false,
             discard_completion: false,
             cursor: 0,
+            chunk: Chunk::default(),
             dbg: DebugCounters::default(),
         }
-    }
-
-    /// Snapshot of the debug counters and stream state, as returned by `VENDOR_REQ_DEBUG`.
-    fn debug_report(&self) -> [u8; 32] {
-        let mut d = [0u8; 32];
-        d[0..4].copy_from_slice(&self.dbg.main_ticks.load(Ordering::SeqCst).to_le_bytes());
-        d[4..8].copy_from_slice(&self.dbg.last_opcode.load(Ordering::SeqCst).to_le_bytes());
-        d[8..12].copy_from_slice(&self.dbg.listen_mode.load(Ordering::SeqCst).to_le_bytes());
-        d[12..16].copy_from_slice(&self.dbg.kicks.load(Ordering::SeqCst).to_le_bytes());
-        d[16..20].copy_from_slice(&self.dbg.completions.load(Ordering::SeqCst).to_le_bytes());
-        d[20..24].copy_from_slice(&self.dbg.commits.load(Ordering::SeqCst).to_le_bytes());
-        d[24..28].copy_from_slice(&self.frames_sent().to_le_bytes());
-        d[28] = self.is_streaming() as u8;
-        d[29] = self.frame_busy() as u8;
-        d[30] = self.in_flight as u8
-            | ((self.discard_completion as u8) << 1)
-            | (((self.staging_phys != 0) as u8) << 2);
-        d[31] = self.cursor as u8;
-        d
     }
 
     pub fn is_streaming(&self) -> bool { self.streaming.load(Ordering::SeqCst) }
@@ -202,8 +200,15 @@ impl<'a, B: UsbBus> UvcClass<'a, B> {
 
     pub fn frames_sent(&self) -> u32 { self.frames_sent.load(Ordering::SeqCst) }
 
-    /// Mark the staging buffer as holding a complete frame. Follow with a `UvcKick` software IRQ.
-    pub fn set_frame_active(&self) { self.frame_active.store(true, Ordering::SeqCst); }
+    /// Mode index (0-based into `UVC_MODES`) of the current or last committed stream
+    pub fn selected_mode(&self) -> usize { self.selected.load(Ordering::SeqCst) }
+
+    /// Describe the chunk that has just been staged, then follow with a `UvcKick` software IRQ.
+    pub fn set_chunk(&mut self, payloads: usize, payload_len: usize, last_len: usize, eof: bool) {
+        self.chunk = Chunk { payloads, payload_len, last_len, eof };
+        self.cursor = 0;
+        self.frame_active.store(true, Ordering::SeqCst);
+    }
 
     /// Forget any in-progress transfer state. Used after the hardware has been re-initialized.
     pub fn reset_state(&mut self) {
@@ -216,28 +221,58 @@ impl<'a, B: UsbBus> UvcClass<'a, B> {
         }
     }
 
-    /// The fixed probe/commit control we report for every GET_* request.
-    fn probe_data() -> [u8; PROBE_LEN] {
+    /// The probe/commit control we report for every GET_* request, for the selected mode.
+    fn probe_data(&self) -> [u8; PROBE_LEN] {
+        let idx = self.selected_mode();
+        let mode = &UVC_MODES[idx];
         let mut d = [0u8; PROBE_LEN];
         d[0..2].copy_from_slice(&1u16.to_le_bytes()); // bmHint: dwFrameInterval is fixed
         d[2] = 1; // bFormatIndex
-        d[3] = 1; // bFrameIndex
-        d[4..8].copy_from_slice(&UVC_FRAME_INTERVAL.to_le_bytes());
+        d[3] = (idx + 1) as u8; // bFrameIndex
+        d[4..8].copy_from_slice(&mode.interval.to_le_bytes());
         // 8..18: wKeyFrameRate, wPFrameRate, wCompQuality, wCompWindowSize, wDelay - all zero
-        d[18..22].copy_from_slice(&(UVC_FRAME_BYTES as u32).to_le_bytes()); // dwMaxVideoFrameSize
-        d[22..26].copy_from_slice(&(PAYLOAD_LEN as u32).to_le_bytes()); // dwMaxPayloadTransferSize
+        d[18..22].copy_from_slice(&(mode.frame_bytes() as u32).to_le_bytes()); // dwMaxVideoFrameSize
+        d[22..26].copy_from_slice(&((PAYLOAD_HDR + mode.payload_data()) as u32).to_le_bytes()); // dwMaxPayloadTransferSize
         d
+    }
+
+    /// Read the host's PROBE proposal out of the EP0 buffer (the hardware completed the data
+    /// stage there) and adopt its frame index if it names one of ours.
+    fn adopt_probe_proposal(&mut self) {
+        if !self.probe_pending {
+            return;
+        }
+        self.probe_pending = false;
+        let Ok(hw) = self.hw.try_lock() else {
+            return;
+        };
+        let buf = hw.ep0_buf.load(Ordering::SeqCst) as usize;
+        if buf == 0 {
+            return;
+        }
+        let data = unsafe { core::slice::from_raw_parts(buf as *const u8, PROBE_LEN) };
+        let format = data[2];
+        let frame = data[3] as usize;
+        if format == 1 && frame >= 1 && frame <= UVC_MODES.len() {
+            self.selected.store(frame - 1, Ordering::SeqCst);
+        }
     }
 
     fn notify_stream_state(&self, state: usize) {
         xous::try_send_message(
             self.conn,
-            xous::Message::new_scalar(Opcode::IrqUvcStreamChange.to_usize().unwrap(), state, 0, 0, 0),
+            xous::Message::new_scalar(
+                Opcode::IrqUvcStreamChange.to_usize().unwrap(),
+                state,
+                self.selected_mode(),
+                0,
+                0,
+            ),
         )
         .ok();
     }
 
-    fn notify_frame_done(&self) {
+    fn notify_chunk_done(&self) {
         xous::try_send_message(
             self.conn,
             xous::Message::new_scalar(Opcode::IrqUvcFrameDone.to_usize().unwrap(), 0, 0, 0, 0),
@@ -246,7 +281,7 @@ impl<'a, B: UsbBus> UvcClass<'a, B> {
     }
 
     fn start_stream(&mut self) {
-        // Abandon any frame in progress. A TD left in the hardware ring by a previous stream may
+        // Abandon any chunk in progress. A TD left in the hardware ring by a previous stream may
         // still complete when the host reads again (then its completion is discarded), or may be
         // gone entirely if the bus was reset in between. Either way, don't let it block the new
         // stream: a discarded completion re-kicks, and at worst one payload is sent twice.
@@ -271,7 +306,7 @@ impl<'a, B: UsbBus> UvcClass<'a, B> {
         }
     }
 
-    /// Interrupt context: start transmitting the staged frame, if nothing is in flight.
+    /// Interrupt context: start transmitting the staged chunk, if nothing is in flight.
     pub fn kick(&mut self) {
         if self.staging_phys == 0 || !self.is_streaming() || self.in_flight || !self.frame_busy() {
             return;
@@ -282,21 +317,43 @@ impl<'a, B: UsbBus> UvcClass<'a, B> {
     /// Interrupt context: enqueue the payload at `self.cursor`.
     fn enqueue_payload(&mut self) {
         let slot = self.staging_phys + self.cursor * PAYLOAD_STRIDE;
-        let flags = if PAYLOAD_LEN % (UVC_MPS as usize) == 0 { CRG_XFER_AZP } else { 0 };
+        let len =
+            if self.cursor + 1 == self.chunk.payloads { self.chunk.last_len } else { self.chunk.payload_len };
+        let flags = if len % (UVC_MPS as usize) == 0 { CRG_XFER_AZP } else { 0 };
         match self.hw.try_lock() {
             Ok(mut hw) => {
                 let pei = CorigineUsb::pei(UVC_EP_NUM as u8, CRG_IN);
                 let _ = hw.app_ptr[pei - 2].take();
-                hw.bulk_xfer(UVC_EP_NUM as u8, CRG_IN, slot, PAYLOAD_LEN, CRG_INT_TARGET, flags);
+                hw.bulk_xfer(UVC_EP_NUM as u8, CRG_IN, slot, len, CRG_INT_TARGET, flags);
                 self.in_flight = true;
             }
             Err(_) => {
-                crate::println!("UVC: hw lock busy, dropping frame");
+                crate::println!("UVC: hw lock busy, dropping chunk");
                 self.cursor = 0;
                 self.frame_active.store(false, Ordering::SeqCst);
-                self.notify_frame_done();
+                self.notify_chunk_done();
             }
         }
+    }
+
+    /// Snapshot of the debug counters and stream state, as returned by `VENDOR_REQ_DEBUG`.
+    fn debug_report(&self) -> [u8; 32] {
+        let mut d = [0u8; 32];
+        d[0..4].copy_from_slice(&self.dbg.main_ticks.load(Ordering::SeqCst).to_le_bytes());
+        d[4..8].copy_from_slice(&self.dbg.last_opcode.load(Ordering::SeqCst).to_le_bytes());
+        d[8..12].copy_from_slice(&self.dbg.listen_mode.load(Ordering::SeqCst).to_le_bytes());
+        d[12..16].copy_from_slice(&self.dbg.kicks.load(Ordering::SeqCst).to_le_bytes());
+        d[16..20].copy_from_slice(&self.dbg.completions.load(Ordering::SeqCst).to_le_bytes());
+        d[20..24].copy_from_slice(&self.dbg.commits.load(Ordering::SeqCst).to_le_bytes());
+        d[24..28].copy_from_slice(&self.frames_sent().to_le_bytes());
+        d[28] = self.is_streaming() as u8;
+        d[29] = self.frame_busy() as u8;
+        d[30] = self.in_flight as u8
+            | ((self.discard_completion as u8) << 1)
+            | (((self.staging_phys != 0) as u8) << 2)
+            | ((self.selected_mode() as u8) << 4);
+        d[31] = self.cursor as u8;
+        d
     }
 }
 
@@ -340,13 +397,14 @@ impl<'a, B: UsbBus> UsbClass<B> for UvcClass<'a, B> {
         ot[6] = 0; // iTerminal
         w.write(CS_INTERFACE, &ot)?;
 
-        // ---- VideoStreaming interface: input header, one uncompressed format with one frame size
+        // ---- VideoStreaming interface: input header, one uncompressed format, one frame
+        // descriptor per mode
         w.interface(self.vs_if, USB_CLASS_VIDEO, SC_VIDEOSTREAMING, 0)?;
-        const VS_TOTAL_LEN: u16 = 14 + 27 + 30;
+        let vs_total_len: u16 = 14 + 27 + 30 * UVC_MODES.len() as u16;
         let mut ih = [0u8; 12];
         ih[0] = VS_INPUT_HEADER;
         ih[1] = 1; // bNumFormats
-        ih[2..4].copy_from_slice(&VS_TOTAL_LEN.to_le_bytes());
+        ih[2..4].copy_from_slice(&vs_total_len.to_le_bytes());
         ih[4] = ep_addr;
         ih[5] = 0; // bmInfo
         ih[6] = OUTPUT_TERMINAL_ID; // bTerminalLink
@@ -360,26 +418,29 @@ impl<'a, B: UsbBus> UsbClass<B> for UvcClass<'a, B> {
         let mut fmt = [0u8; 25];
         fmt[0] = VS_FORMAT_UNCOMPRESSED;
         fmt[1] = 1; // bFormatIndex
-        fmt[2] = 1; // bNumFrameDescriptors
+        fmt[2] = UVC_MODES.len() as u8; // bNumFrameDescriptors
         fmt[3..19].copy_from_slice(&UYVY_GUID);
         fmt[19] = 16; // bBitsPerPixel
         fmt[20] = 1; // bDefaultFrameIndex
         // 21..25: aspect ratio X/Y, interlace flags, copy protect: zero
         w.write(CS_INTERFACE, &fmt)?;
 
-        let mut frm = [0u8; 28];
-        frm[0] = VS_FRAME_UNCOMPRESSED;
-        frm[1] = 1; // bFrameIndex
-        frm[2] = 0; // bmCapabilities
-        frm[3..5].copy_from_slice(&(UVC_WIDTH as u16).to_le_bytes());
-        frm[5..7].copy_from_slice(&(UVC_HEIGHT as u16).to_le_bytes());
-        frm[7..11].copy_from_slice(&UVC_BIT_RATE.to_le_bytes()); // dwMinBitRate
-        frm[11..15].copy_from_slice(&UVC_BIT_RATE.to_le_bytes()); // dwMaxBitRate
-        frm[15..19].copy_from_slice(&(UVC_FRAME_BYTES as u32).to_le_bytes()); // dwMaxVideoFrameBufferSize
-        frm[19..23].copy_from_slice(&UVC_FRAME_INTERVAL.to_le_bytes()); // dwDefaultFrameInterval
-        frm[23] = 1; // bFrameIntervalType: one discrete interval
-        frm[24..28].copy_from_slice(&UVC_FRAME_INTERVAL.to_le_bytes());
-        w.write(CS_INTERFACE, &frm)?;
+        for (i, mode) in UVC_MODES.iter().enumerate() {
+            let bit_rate: u32 = (mode.frame_bytes() as u64 * 8 * 10_000_000 / mode.interval as u64) as u32;
+            let mut frm = [0u8; 28];
+            frm[0] = VS_FRAME_UNCOMPRESSED;
+            frm[1] = (i + 1) as u8; // bFrameIndex
+            frm[2] = 0; // bmCapabilities
+            frm[3..5].copy_from_slice(&(mode.width as u16).to_le_bytes());
+            frm[5..7].copy_from_slice(&(mode.height as u16).to_le_bytes());
+            frm[7..11].copy_from_slice(&bit_rate.to_le_bytes()); // dwMinBitRate
+            frm[11..15].copy_from_slice(&bit_rate.to_le_bytes()); // dwMaxBitRate
+            frm[15..19].copy_from_slice(&(mode.frame_bytes() as u32).to_le_bytes()); // dwMaxVideoFrameBufferSize
+            frm[19..23].copy_from_slice(&mode.interval.to_le_bytes()); // dwDefaultFrameInterval
+            frm[23] = 1; // bFrameIntervalType: one discrete interval
+            frm[24..28].copy_from_slice(&mode.interval.to_le_bytes());
+            w.write(CS_INTERFACE, &frm)?;
+        }
 
         w.endpoint(&self.ep_in)?;
         Ok(())
@@ -404,8 +465,13 @@ impl<'a, B: UsbBus> UsbClass<B> for UvcClass<'a, B> {
             return;
         }
         match s[3] {
-            VS_PROBE_CONTROL => {}
+            VS_PROBE_CONTROL => {
+                // the proposal lands in the EP0 buffer shortly after; read it on the next GET
+                self.probe_pending = true;
+            }
             VS_COMMIT_CONTROL => {
+                // COMMIT carries what the host last read back from PROBE
+                self.adopt_probe_proposal();
                 self.dbg.commits.fetch_add(1, Ordering::SeqCst);
                 self.start_stream();
             }
@@ -436,7 +502,10 @@ impl<'a, B: UsbBus> UsbClass<B> for UvcClass<'a, B> {
         let len = req.length as usize;
         match (selector, req.request) {
             (VS_PROBE_CONTROL | VS_COMMIT_CONTROL, GET_CUR | GET_MIN | GET_MAX | GET_DEF) => {
-                let data = Self::probe_data();
+                if req.request == GET_CUR {
+                    self.adopt_probe_proposal();
+                }
+                let data = self.probe_data();
                 xfer.accept_with(&data[..len.min(data.len())]).ok();
             }
             (VS_PROBE_CONTROL | VS_COMMIT_CONTROL, GET_RES) => {
@@ -468,11 +537,9 @@ impl<'a, B: UsbBus> UsbClass<B> for UvcClass<'a, B> {
                 if (req.index & 0xff) as u8 != vs_if {
                     return;
                 }
+                // Not reached on this core for requests with a data stage (see `poll`); kept for
+                // completeness should the driver ever deliver them.
                 let selector = (req.value >> 8) as u8;
-                // The host's proposed parameters are not inspected: with a single format and frame
-                // size, every GET_CUR after a SET_CUR returns our fixed values, which is what the
-                // spec allows a device to do. (The HAL also does not deliver EP0 OUT data stages to
-                // classes; see the SetupPkt handler in the driver.)
                 match (selector, req.request) {
                     (VS_PROBE_CONTROL, SET_CUR) => {
                         xfer.accept().ok();
@@ -515,7 +582,7 @@ impl<'a, B: UsbBus> UsbClass<B> for UvcClass<'a, B> {
         }
         if self.discard_completion {
             self.discard_completion = false;
-            // a new frame may already be waiting
+            // a new chunk may already be waiting
             self.kick();
             return;
         }
@@ -523,30 +590,49 @@ impl<'a, B: UsbBus> UsbClass<B> for UvcClass<'a, B> {
             return;
         }
         self.cursor += 1;
-        if self.cursor < PAYLOADS_PER_FRAME {
+        if self.cursor < self.chunk.payloads {
             self.enqueue_payload();
         } else {
             self.cursor = 0;
-            self.frames_sent.fetch_add(1, Ordering::SeqCst);
+            self.chunks_sent.fetch_add(1, Ordering::SeqCst);
+            if self.chunk.eof {
+                self.frames_sent.fetch_add(1, Ordering::SeqCst);
+            }
             self.frame_active.store(false, Ordering::SeqCst);
-            self.notify_frame_done();
+            self.notify_chunk_done();
         }
     }
 }
 
-/// Copy a raw UYVY frame into the staging buffer, writing a payload header in front of every
-/// slot. `fid` alternates between frames so the host can detect frame boundaries.
+/// Copy a chunk of raw UYVY image data into the staging buffer, writing a payload header in
+/// front of every slot. Returns (payloads, payload_len, last_len) for `UvcClass::set_chunk`.
+/// `fid` is the frame ID bit for this frame; `eof` marks the chunk that ends the frame.
 ///
 /// The staging buffer is IFRAM (uncached, word-wide bus); `copy_from_slice` on aligned slices
 /// compiles to a word copy, which is what we want.
-pub fn stage_frame(staging: &mut [u8], frame: &[u8], fid: u8) {
+pub fn stage_chunk(
+    staging: &mut [u8],
+    data: &[u8],
+    payload_data: usize,
+    fid: u8,
+    eof: bool,
+) -> (usize, usize, usize) {
     debug_assert!(staging.len() >= STAGING_BYTES);
-    debug_assert!(frame.len() >= UVC_FRAME_BYTES);
-    for i in 0..PAYLOADS_PER_FRAME {
-        let slot = &mut staging[i * PAYLOAD_STRIDE..i * PAYLOAD_STRIDE + PAYLOAD_LEN];
-        let last = i == PAYLOADS_PER_FRAME - 1;
+    let payload_data = payload_data.clamp(1, UVC_MAX_PAYLOAD_DATA);
+    let payloads = ((data.len() + payload_data - 1) / payload_data).clamp(1, UVC_CHUNK_PAYLOADS);
+    let mut last_len = PAYLOAD_HDR;
+    for i in 0..payloads {
+        let start = i * payload_data;
+        let end = (start + payload_data).min(data.len());
+        let n = end - start;
+        let slot = &mut staging[i * PAYLOAD_STRIDE..i * PAYLOAD_STRIDE + PAYLOAD_HDR + n];
+        let last = i == payloads - 1;
         slot[0] = PAYLOAD_HDR as u8;
-        slot[1] = HDR_EOH | (fid & HDR_FID) | if last { HDR_EOF } else { 0 };
-        slot[PAYLOAD_HDR..].copy_from_slice(&frame[i * PAYLOAD_DATA..(i + 1) * PAYLOAD_DATA]);
+        slot[1] = HDR_EOH | (fid & HDR_FID) | if last && eof { HDR_EOF } else { 0 };
+        slot[PAYLOAD_HDR..].copy_from_slice(&data[start..end]);
+        if last {
+            last_len = PAYLOAD_HDR + n;
+        }
     }
+    (payloads, PAYLOAD_HDR + payload_data, last_len)
 }
