@@ -208,6 +208,14 @@ struct WebcamState {
     restarts: usize,
     /// words to skip at the start of every captured line (the stale pipeline prefix)
     crop_words: usize,
+    /// started from the console: the host's stream stop must not switch the camera off
+    pinned: bool,
+    /// requested exposure handling; persists across sessions
+    exposure_mode: WebcamExposureMode,
+    /// true once the current session has applied a lock or manual setting
+    exposure_applied: bool,
+    /// last exposure state read from the sensor
+    exposure: bao1x_hal::gc2145::Gc2145Exposure,
 }
 
 #[cfg(feature = "uvc")]
@@ -216,7 +224,19 @@ impl WebcamState {
         let pages = (UVC_FRAME_BYTES + 4095) / 4096;
         let frame = xous::map_memory(None, None, pages * 4096, xous::MemoryFlags::R | xous::MemoryFlags::W)
             .expect("couldn't allocate webcam frame buffer");
-        WebcamState { active: false, frame, captured: 0, sent: 0, dropped: 0, restarts: 0, crop_words: 3 }
+        WebcamState {
+            active: false,
+            frame,
+            captured: 0,
+            sent: 0,
+            dropped: 0,
+            restarts: 0,
+            crop_words: 3,
+            pinned: false,
+            exposure_mode: WebcamExposureMode::Auto,
+            exposure_applied: false,
+            exposure: Default::default(),
+        }
     }
 }
 
@@ -806,6 +826,16 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                             }
                         }
                         webcam.captured += 1;
+                        // Lock waits for the automatic engines to settle on the scene first
+                        // (about 20 frames); manual settings are applied at start.
+                        if !webcam.exposure_applied
+                            && webcam.exposure_mode == WebcamExposureMode::Lock
+                            && webcam.captured >= 20
+                        {
+                            webcam.exposure = cam.lock_exposure(&mut i2c);
+                            webcam.exposure_applied = true;
+                            log::info!("webcam: exposure locked at {:?}", webcam.exposure);
+                        }
                         cam.capture_async();
                         match usb.uvc_send_frame(webcam.frame, UVC_FRAME_BYTES) {
                             Ok(UvcFrameResult::Sent) => webcam.sent += 1,
@@ -1003,8 +1033,15 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                 }
                 #[cfg(feature = "uvc")]
                 GfxOpcode::WebcamControl => {
-                    let on = msg.body.scalar_message().map(|s| s.arg1 != 0).unwrap_or(false);
+                    let (on, from_console) = msg
+                        .body
+                        .scalar_message()
+                        .map(|s| (s.arg1 != 0, s.arg2 != 0))
+                        .unwrap_or((false, false));
                     if on {
+                        if from_console {
+                            webcam.pinned = true;
+                        }
                         if webcam.active {
                             log::debug!("webcam already active");
                         } else if qr_request.is_some() {
@@ -1025,10 +1062,21 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                 &tt,
                                 &udma_global,
                             );
+                            webcam.exposure_applied = false;
+                            if let WebcamExposureMode::Manual { exposure, pregain, postgain } =
+                                webcam.exposure_mode
+                            {
+                                cam.set_exposure(&mut i2c, exposure, pregain, postgain, None);
+                                webcam.exposure = cam.read_exposure(&mut i2c);
+                                webcam.exposure_applied = true;
+                            }
                             webcam_arm_watchdog(cid, webcam.captured, &tt);
                             log::info!("webcam started");
                         }
+                    } else if webcam.active && webcam.pinned && !from_console {
+                        log::debug!("webcam: host stream stopped; camera stays on (pinned by console)");
                     } else if webcam.active {
+                        webcam.pinned = false;
                         webcam.active = false;
                         camera_power_down(&iox, &mut timer, cam_clk, cam_pdwn, &tt);
                         log::info!(
@@ -1076,6 +1124,62 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                     }
                 }
                 #[cfg(feature = "uvc")]
+                #[cfg(feature = "uvc")]
+                GfxOpcode::WebcamExposure => {
+                    let (a1, a2, a3, a4) = match msg.body.scalar_message() {
+                        Some(sc) => (sc.arg1, sc.arg2, sc.arg3, sc.arg4),
+                        None => (0, 0, 0, 0),
+                    };
+                    webcam.exposure_mode = match a1 {
+                        1 => WebcamExposureMode::Lock,
+                        2 => WebcamExposureMode::Manual {
+                            exposure: (a2 as u16) & 0x1fff,
+                            pregain: a3 as u8,
+                            postgain: a4 as u8,
+                        },
+                        _ => WebcamExposureMode::Auto,
+                    };
+                    webcam.exposure_applied = false;
+                    if webcam.active {
+                        match webcam.exposure_mode {
+                            WebcamExposureMode::Auto => {
+                                cam.unlock_exposure(&mut i2c);
+                                webcam.exposure = cam.read_exposure(&mut i2c);
+                            }
+                            WebcamExposureMode::Lock => {
+                                webcam.exposure = cam.lock_exposure(&mut i2c);
+                                webcam.exposure_applied = true;
+                            }
+                            WebcamExposureMode::Manual { exposure, pregain, postgain } => {
+                                cam.set_exposure(&mut i2c, exposure, pregain, postgain, None);
+                                webcam.exposure = cam.read_exposure(&mut i2c);
+                                webcam.exposure_applied = true;
+                            }
+                        }
+                        log::info!("webcam: exposure {:?} -> {:?}", webcam.exposure_mode, webcam.exposure);
+                    }
+                    if let Some(scalar) = msg.body.scalar_message_mut() {
+                        scalar.arg1 = 1;
+                    }
+                }
+                #[cfg(feature = "uvc")]
+                GfxOpcode::WebcamExposureStatus => {
+                    if webcam.active {
+                        webcam.exposure = cam.read_exposure(&mut i2c);
+                    }
+                    if let Some(scalar) = msg.body.scalar_message_mut() {
+                        let e = webcam.exposure;
+                        scalar.arg1 = match webcam.exposure_mode {
+                            WebcamExposureMode::Auto => 0,
+                            WebcamExposureMode::Lock => 1,
+                            WebcamExposureMode::Manual { .. } => 2,
+                        };
+                        scalar.arg2 = e.exposure as usize;
+                        scalar.arg3 = (e.pregain as usize) << 8 | e.postgain as usize;
+                        scalar.arg4 =
+                            (e.awb[0] as usize) << 16 | (e.awb[1] as usize) << 8 | e.awb[2] as usize;
+                    }
+                }
                 GfxOpcode::WebcamStatus => {
                     if let Some(scalar) = msg.body.scalar_message_mut() {
                         scalar.arg1 = if webcam.active { 1 } else { 0 };

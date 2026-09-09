@@ -122,8 +122,10 @@ pub enum GfxOpcode {
     #[cfg(feature = "board-baosec")]
     DryRun,
     /// Start (arg1 = 1) or stop (arg1 = 0) webcam capture: frames are forwarded to the USB
-    /// video class function. Sent by the USB service's stream observer callback, and by the
-    /// console. If sent as a blocking scalar, arg1 of the reply is the resulting active state.
+    /// video class function. Sent by the USB service's stream observer callback (arg2 = 0), and
+    /// by the console (arg2 = 1, "pinned": a pinned camera ignores the observer's stop and only
+    /// `webcam off` releases it). If sent as a blocking scalar, arg1 of the reply is the
+    /// resulting active state.
     #[cfg(feature = "board-baosec")]
     WebcamControl,
     /// Blocking scalar; returns (active, frames captured, frames sent to USB, frames dropped)
@@ -132,6 +134,16 @@ pub enum GfxOpcode {
     /// Internal: checks that frames are arriving after a webcam start; restarts the camera if not
     #[cfg(feature = "board-baosec")]
     WebcamWatchdog,
+    /// Exposure control (blocking scalar). arg1: 0 = auto, 1 = lock at the current values,
+    /// 2 = manual with arg2 = exposure lines, arg3 = pre-gain, arg4 = post-gain (4.4 fixed point).
+    /// The setting persists across capture sessions. Reply arg1 = 1 on success.
+    #[cfg(feature = "board-baosec")]
+    WebcamExposure,
+    /// Blocking scalar; returns arg1 = mode (0 auto, 1 locked, 2 manual), arg2 = exposure lines,
+    /// arg3 = pre-gain << 8 | post-gain, arg4 = AWB R << 16 | G << 8 | B. Live values while the
+    /// camera is on, otherwise the last seen.
+    #[cfg(feature = "board-baosec")]
+    WebcamExposureStatus,
 
     /// Gutter for invalid calls
     InvalidCall,
@@ -189,6 +201,33 @@ pub struct BaosecBitmap {
     pub top_left: crate::minigfx::Point,
     // bounding box of the bitmap - if we want only a portion of the bitmap to be drawn
     pub bounding_box: crate::minigfx::Rectangle,
+}
+
+/// Exposure setting for the webcam, see `GfxOpcode::WebcamExposure`
+#[cfg(feature = "board-baosec")]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum WebcamExposureMode {
+    Auto,
+    /// freeze whatever the automatic engines have converged on
+    Lock,
+    /// explicit exposure (line units) and pre/post gains (4.4 fixed point, 0x40 = 1.0)
+    Manual {
+        exposure: u16,
+        pregain: u8,
+        postgain: u8,
+    },
+}
+
+/// Exposure state reported by `GfxOpcode::WebcamExposureStatus`
+#[cfg(feature = "board-baosec")]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct WebcamExposureStatus {
+    /// 0 auto, 1 locked, 2 manual
+    pub mode: u8,
+    pub exposure: u16,
+    pub pregain: u8,
+    pub postgain: u8,
+    pub awb: [u8; 3],
 }
 
 /// Webcam capture statistics, see `GfxOpcode::WebcamStatus`

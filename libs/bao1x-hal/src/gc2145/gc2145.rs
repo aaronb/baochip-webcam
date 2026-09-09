@@ -20,6 +20,21 @@ pub const CFG_SHIFT: utralib::Field = utralib::Field::new(4, 11, REG_CAM_CFG_GLO
 pub const CFG_SOF_SYNC: utralib::Field = utralib::Field::new(1, 30, REG_CAM_CFG_GLOB);
 pub const CFG_GLOB_EN: utralib::Field = utralib::Field::new(1, 31, REG_CAM_CFG_GLOB);
 
+/// Exposure and white-balance state of the GC2145 (page 0 registers 0x03/0x04, 0xb1..0xb6, 0x82).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Gc2145Exposure {
+    /// coarse exposure in line units (13 bits)
+    pub exposure: u16,
+    /// analog pre-gain, 4.4 fixed point (0x40 = 1.0)
+    pub pregain: u8,
+    /// digital post-gain, 4.4 fixed point
+    pub postgain: u8,
+    /// white-balance gains R, G, B, 4.4 fixed point
+    pub awb: [u8; 3],
+    pub aec_on: bool,
+    pub awb_on: bool,
+}
+
 pub struct Gc2145 {
     csr: CSR<u32>,
     ifram: Option<IframRange>,
@@ -78,6 +93,70 @@ impl Gc2145 {
             resolution: Resolution::Res160x120,
             slicing: None,
         }
+    }
+
+    /// Snapshot of the sensor's exposure and white-balance state (page 0 registers).
+    pub fn read_exposure(&self, i2c: &mut dyn I2cApi) -> Gc2145Exposure {
+        self.poke(i2c, GC2145_REG_RESET, GC2145_SET_P0_REGS);
+        let mut b = [0u8; 1];
+        let mut rd = |adr: u8| {
+            self.peek(i2c, adr, &mut b);
+            b[0]
+        };
+        let exposure = ((rd(0x03) as u16 & 0x1f) << 8) | rd(0x04) as u16;
+        let pregain = rd(0xb1);
+        let postgain = rd(0xb2);
+        let awb = [rd(0xb3), rd(0xb4), rd(0xb5)];
+        let aec_on = rd(0xb6) & 0x01 != 0;
+        let awb_on = rd(0x82) & 0x02 != 0;
+        Gc2145Exposure { exposure, pregain, postgain, awb, aec_on, awb_on }
+    }
+
+    /// Freeze exposure and white balance at their current values: disable the AEC and AWB
+    /// engines and write the values they had reached back as manual settings. Returns the
+    /// frozen state.
+    pub fn lock_exposure(&self, i2c: &mut dyn I2cApi) -> Gc2145Exposure {
+        let cur = self.read_exposure(i2c);
+        self.set_exposure(i2c, cur.exposure, cur.pregain, cur.postgain, Some(cur.awb));
+        Gc2145Exposure { aec_on: false, awb_on: false, ..cur }
+    }
+
+    /// Manual exposure: AEC and AWB off, `exposure` in line units (13 bits), gains in the
+    /// sensor's 4.4 fixed-point format (0x40 = 1.0). `awb` gains are R, G, B; `None` leaves the
+    /// current white-balance gains in place.
+    pub fn set_exposure(
+        &self,
+        i2c: &mut dyn I2cApi,
+        exposure: u16,
+        pregain: u8,
+        postgain: u8,
+        awb: Option<[u8; 3]>,
+    ) {
+        self.poke(i2c, GC2145_REG_RESET, GC2145_SET_P0_REGS);
+        let mut b = [0u8; 1];
+        self.peek(i2c, 0xb6, &mut b);
+        self.poke(i2c, 0xb6, b[0] & !0x01);
+        self.peek(i2c, 0x82, &mut b);
+        self.poke(i2c, 0x82, b[0] & !0x02);
+        self.poke(i2c, 0x03, ((exposure >> 8) & 0x1f) as u8);
+        self.poke(i2c, 0x04, (exposure & 0xff) as u8);
+        self.poke(i2c, 0xb1, pregain);
+        self.poke(i2c, 0xb2, postgain);
+        if let Some([r, g, bb]) = awb {
+            self.poke(i2c, 0xb3, r);
+            self.poke(i2c, 0xb4, g);
+            self.poke(i2c, 0xb5, bb);
+        }
+    }
+
+    /// Hand exposure and white balance back to the sensor's automatic engines.
+    pub fn unlock_exposure(&self, i2c: &mut dyn I2cApi) {
+        self.poke(i2c, GC2145_REG_RESET, GC2145_SET_P0_REGS);
+        let mut b = [0u8; 1];
+        self.peek(i2c, 0xb6, &mut b);
+        self.poke(i2c, 0xb6, b[0] | 0x01);
+        self.peek(i2c, 0x82, &mut b);
+        self.poke(i2c, 0x82, b[0] | 0x02);
     }
 
     pub fn release_ifram(&mut self) {
@@ -227,7 +306,7 @@ impl Gc2145 {
         // Sub-sampling ratio: 320x240 reads a 640x480 window at 1/2. 160x120 keeps the same
         // 640x480 window (same field of view) at 1/4 rather than zooming in on a 320x240 window.
         let ratio = match resolution {
-            Resolution::Res160x120 => 4u16,
+            Resolution::Res160x120 => 8u16, // TRIAL: 1280x960 window, ~80% of the sensor width
             _ => 2u16,
         };
         // Full-frame capture (no slicing) shows the first ~6 pixels of every line as dark:

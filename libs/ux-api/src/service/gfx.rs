@@ -769,7 +769,9 @@ impl Gfx {
         }
     }
 
-    /// Start or stop webcam capture. Returns the resulting active state.
+    /// Start or stop webcam capture from the console: a camera started this way stays on until
+    /// stopped this way, regardless of the host opening and closing the video stream. Returns
+    /// the resulting active state.
     #[cfg(feature = "board-baosec")]
     pub fn webcam_control(&self, on: bool) -> Result<bool, xous::Error> {
         match send_message(
@@ -777,12 +779,48 @@ impl Gfx {
             Message::new_blocking_scalar(
                 GfxOpcode::WebcamControl.to_usize().unwrap(),
                 if on { 1 } else { 0 },
-                0,
+                1,
                 0,
                 0,
             ),
         )? {
             xous::Result::Scalar5(_, active, _, _, _) => Ok(active != 0),
+            _ => Err(xous::Error::InternalError),
+        }
+    }
+
+    /// Set the webcam exposure mode; persists across capture sessions.
+    #[cfg(feature = "board-baosec")]
+    pub fn webcam_exposure(&self, mode: WebcamExposureMode) -> Result<(), xous::Error> {
+        let (a1, a2, a3, a4) = match mode {
+            WebcamExposureMode::Auto => (0, 0, 0, 0),
+            WebcamExposureMode::Lock => (1, 0, 0, 0),
+            WebcamExposureMode::Manual { exposure, pregain, postgain } => {
+                (2, exposure as usize, pregain as usize, postgain as usize)
+            }
+        };
+        match send_message(
+            self.conn,
+            Message::new_blocking_scalar(GfxOpcode::WebcamExposure.to_usize().unwrap(), a1, a2, a3, a4),
+        )? {
+            xous::Result::Scalar5(_, 1, _, _, _) => Ok(()),
+            _ => Err(xous::Error::InternalError),
+        }
+    }
+
+    #[cfg(feature = "board-baosec")]
+    pub fn webcam_exposure_status(&self) -> Result<WebcamExposureStatus, xous::Error> {
+        match send_message(
+            self.conn,
+            Message::new_blocking_scalar(GfxOpcode::WebcamExposureStatus.to_usize().unwrap(), 0, 0, 0, 0),
+        )? {
+            xous::Result::Scalar5(_, mode, exposure, gains, awb) => Ok(WebcamExposureStatus {
+                mode: mode as u8,
+                exposure: exposure as u16,
+                pregain: (gains >> 8) as u8,
+                postgain: gains as u8,
+                awb: [(awb >> 16) as u8, (awb >> 8) as u8, awb as u8],
+            }),
             _ => Err(xous::Error::InternalError),
         }
     }
