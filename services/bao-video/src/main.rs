@@ -206,6 +206,8 @@ struct WebcamState {
     sent: usize,
     dropped: usize,
     restarts: usize,
+    /// words to skip at the start of every captured line (the stale pipeline prefix)
+    crop_words: usize,
 }
 
 #[cfg(feature = "uvc")]
@@ -214,7 +216,7 @@ impl WebcamState {
         let pages = (UVC_FRAME_BYTES + 4095) / 4096;
         let frame = xous::map_memory(None, None, pages * 4096, xous::MemoryFlags::R | xous::MemoryFlags::W)
             .expect("couldn't allocate webcam frame buffer");
-        WebcamState { active: false, frame, captured: 0, sent: 0, dropped: 0, restarts: 0 }
+        WebcamState { active: false, frame, captured: 0, sent: 0, dropped: 0, restarts: 0, crop_words: 3 }
     }
 }
 
@@ -279,11 +281,24 @@ fn webcam_start_capture(
     log::info!("webcam: camera pid {:x}, mid {:x}", pid, mid);
     cam.init(i2c, bao1x_api::camera::Resolution::Res160x120);
     tt.sleep_ms(15).ok();
-    // drop the dark columns at the start of every line (see Gc2145::LINE_PAD)
+    // Capture the padded line from column 0 and take rows 0..h. The first 3 words of every
+    // captured line are pipeline carry-over from the previous line (measured: they correlate
+    // with its last 6 pixels), so the frame copy drops them; see the CamIrq handler.
     let (w, h): (usize, usize) = bao1x_api::camera::Resolution::Res160x120.into();
-    cam.set_slicing((Gc2145::LINE_PAD, 0), (w + Gc2145::LINE_PAD, h));
+    cam.set_slicing((0, 0), (w + Gc2145::LINE_PAD, h));
+    // The init table enables the sensor's horizontal mirror (P0 reg 0x17 bit 0, reads 0x15),
+    // which is right for the badge's own display but mirrors the webcam picture. Clear it.
+    {
+        cam.poke(i2c, 0xfe, 0x00);
+        let mut v = [0u8; 1];
+        cam.peek(i2c, 0x17, &mut v);
+        cam.poke(i2c, 0x17, v[0] & !0x01);
+    }
     let (cols, rows) = cam.resolution();
-    assert!(cols * rows * 2 == UVC_FRAME_BYTES, "camera frame size doesn't match the UVC frame size");
+    assert!(
+        (cols - Gc2145::LINE_PAD) * rows * 2 == UVC_FRAME_BYTES,
+        "camera frame size doesn't match the UVC frame size"
+    );
     cam.capture_async();
 }
 
@@ -775,10 +790,20 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                         // then hand the copy to the USB service. That call blocks until the frame
                         // has gone out, or is discarded because the host isn't streaming.
                         {
+                            // Each captured line is LINE_PAD pixels wider than the image. Its
+                            // first 3 words (6 px) are stale (pipeline carry-over) and the
+                            // sensor's last few columns are dark, so take one image width
+                            // starting at word 3 of every line.
                             let fb: &[u32] = cam.rx_buf_unskipped();
-                            let words = UVC_FRAME_BYTES / core::mem::size_of::<u32>();
                             let dst = unsafe { webcam.frame.as_slice_mut::<u32>() };
-                            dst[..words].copy_from_slice(&fb[..words]);
+                            let (w, h): (usize, usize) = bao1x_api::camera::Resolution::Res160x120.into();
+                            let src_words = (w + Gc2145::LINE_PAD) * 2 / core::mem::size_of::<u32>();
+                            let dst_words = w * 2 / core::mem::size_of::<u32>();
+                            let crop = webcam.crop_words.min(src_words - dst_words);
+                            for row in 0..h {
+                                let src = &fb[row * src_words + crop..][..dst_words];
+                                dst[row * dst_words..][..dst_words].copy_from_slice(src);
+                            }
                         }
                         webcam.captured += 1;
                         cam.capture_async();

@@ -34,9 +34,11 @@ impl Udma for Gc2145 {
 }
 
 impl Gc2145 {
-    /// Extra columns captured per line for `Resolution::Res160x120`, to be sliced off with
-    /// `set_slicing((LINE_PAD, 0), (width + LINE_PAD, height))`. Word-aligned (8 px = 16 bytes).
-    pub const LINE_PAD: usize = 8;
+    /// Extra columns captured per line for `Resolution::Res160x120`. The first 3 words (6 px) of
+    /// every captured line are stale pipeline carry-over, and the sensor's last few columns
+    /// come out dark, so the consumer takes one image width starting 3 words into each line
+    /// (see bao-video's webcam path). Word-aligned (24 px = 48 bytes).
+    pub const LINE_PAD: usize = 24;
 
     #[cfg(feature = "std")]
     /// Safety: clocks must be turned on before this is called
