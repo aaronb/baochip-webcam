@@ -348,13 +348,17 @@ fn webcam_start_capture(
     // the 3 stale words at the start of every line (see the CamIrq handler).
     cam.init_window(i2c, mode.line_px() as u16, (mode.height + 1) as u16, mode.ratio);
     tt.sleep_ms(15).ok();
-    // The init table enables the sensor's horizontal mirror (P0 reg 0x17 bit 0, reads 0x15),
-    // which is right for the badge's own display but mirrors the webcam picture. Clear it.
+    // The init table enables the sensor's horizontal mirror only (P0 reg 0x17 bit 0, reads
+    // 0x15), which is right for the badge's own display but mirrors the webcam picture. With
+    // the mirror off the picture is un-mirrored but upside down for a badge held with its
+    // text upright (a page under the camera comes out rotated a half turn on the host and on
+    // the OLED preview alike). Mirror plus vertical flip (bits 1:0 = 0b11) rotates the readout
+    // a half turn, which is un-mirrored and upright.
     {
         cam.poke(i2c, 0xfe, 0x00);
         let mut v = [0u8; 1];
         cam.peek(i2c, 0x17, &mut v);
-        cam.poke(i2c, 0x17, v[0] & !0x01);
+        cam.poke(i2c, 0x17, v[0] | 0x03);
     }
     if mode.ratio == 1 {
         cam.poke(i2c, 0xfe, 0x00);
@@ -413,12 +417,13 @@ fn webcam_preview_rows(fb: &mut [u32], src: &[u32], mode: &UvcMode, first_row: u
             let word = line[x / 2];
             let luma = if x & 1 == 0 { (word >> 8) & 0xff } else { (word >> 24) & 0xff } as u8;
             let threshold = BAYER[py & 3][px & 3] * 16 + 8;
-            // same layout as the OLED driver's framebuffer: one bit per pixel, row-major
+            // same layout as the OLED driver's framebuffer: one bit per pixel, row-major, and a
+            // set bit is a *dark* pixel (`PixelColor::Dark` is 1; `clear()` fills with ones)
             let bitnum = px + py * bao1x_hal::sh1107::COLUMN as usize;
             if luma > threshold {
-                fb[bitnum / 32] |= 1 << (bitnum % 32);
-            } else {
                 fb[bitnum / 32] &= !(1 << (bitnum % 32));
+            } else {
+                fb[bitnum / 32] |= 1 << (bitnum % 32);
             }
         }
     }
