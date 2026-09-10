@@ -225,6 +225,11 @@ struct WebcamState {
     clkdiv_ratio1: u8,
     /// draw a dithered preview of the captured frames on the OLED
     preview: bool,
+    /// the preview's own framebuffer: the UI keeps painting the display's buffer while the
+    /// webcam runs (the vault's idle screen is animated), so the preview cannot live there
+    preview_fb: Vec<u32>,
+    /// the UI's framebuffer contents, held while the preview is swapped in for a transfer
+    ui_fb: Vec<u32>,
     /// elapsed-ms timestamp of the last completed frame, for the preview's rate figure
     last_frame_ms: u64,
     /// frame rate in tenths of a frame per second, for the preview status line
@@ -265,6 +270,8 @@ impl WebcamState {
             clkdiv_ratio1: 0x19,
             first_session: true,
             preview: true,
+            preview_fb: vec![0u32; (bao1x_hal::sh1107::COLUMN * bao1x_hal::sh1107::ROW) as usize / 32],
+            ui_fb: vec![0u32; (bao1x_hal::sh1107::COLUMN * bao1x_hal::sh1107::ROW) as usize / 32],
             last_frame_ms: 0,
             fps_x10: 0,
             pinned: false,
@@ -384,9 +391,9 @@ fn preview_geometry(mode: &UvcMode) -> (usize, usize, usize, usize) {
 }
 
 /// Render image rows `first_row..first_row + n` (from a chunk buffer holding exactly those rows,
-/// UYVY, `mode.width` wide) onto the OLED with an ordered 4x4 dither.
+/// UYVY, `mode.width` wide) into the preview framebuffer with an ordered 4x4 dither.
 #[cfg(feature = "uvc")]
-fn webcam_preview_rows(display: &mut Oled128x128, src: &[u32], mode: &UvcMode, first_row: usize, n: usize) {
+fn webcam_preview_rows(fb: &mut [u32], src: &[u32], mode: &UvcMode, first_row: usize, n: usize) {
     const BAYER: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
     let (step, x0, y0, rows) = preview_geometry(mode);
     let words_per_row = mode.width * 2 / core::mem::size_of::<u32>();
@@ -406,12 +413,12 @@ fn webcam_preview_rows(display: &mut Oled128x128, src: &[u32], mode: &UvcMode, f
             let word = line[x / 2];
             let luma = if x & 1 == 0 { (word >> 8) & 0xff } else { (word >> 24) & 0xff } as u8;
             let threshold = BAYER[py & 3][px & 3] * 16 + 8;
-            let on = luma > threshold;
-            unsafe {
-                display.put_pixel_unchecked(
-                    Point::new(px as isize, py as isize),
-                    if on { Mono::White.into() } else { Mono::Black.into() },
-                );
+            // same layout as the OLED driver's framebuffer: one bit per pixel, row-major
+            let bitnum = px + py * bao1x_hal::sh1107::COLUMN as usize;
+            if luma > threshold {
+                fb[bitnum / 32] |= 1 << (bitnum % 32);
+            } else {
+                fb[bitnum / 32] &= !(1 << (bitnum % 32));
             }
         }
     }
@@ -958,6 +965,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                             webcam.frame_locked = false;
                             webcam.exposure_applied = false;
                             let m = webcam.custom.unwrap_or(UVC_MODES[webcam.mode]);
+                            webcam.preview_fb.fill(0);
                             webcam_start_capture(
                                 &mut cam,
                                 &mut i2c,
@@ -1010,7 +1018,13 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                             }
                             if webcam.preview {
                                 let src = unsafe { webcam.frame.as_slice::<u32>() };
-                                webcam_preview_rows(&mut display, src, &mode, band * mode.band_rows + row, n);
+                                webcam_preview_rows(
+                                    &mut webcam.preview_fb,
+                                    src,
+                                    &mode,
+                                    band * mode.band_rows + row,
+                                    n,
+                                );
                             }
                             let first = first_band && row == 0;
                             let last = last_band && row + n >= rows;
@@ -1022,10 +1036,15 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                         webcam.fps_x10 = (10_000 / dt) as u32;
                                         webcam.last_frame_ms = now;
                                     }
+                                    // swap the preview in for the transfer only, so the UI's
+                                    // buffer is left as the UI last painted it
+                                    webcam.ui_fb.copy_from_slice(display.buffer());
+                                    display.blit_screen(&webcam.preview_fb);
                                     webcam_preview_status(&mut display, &mode, &webcam, screen_size);
                                     display.draw().unwrap_or_else(|_| {
                                         display_timeout_handler(&udma_global, &mut display)
                                     });
+                                    display.blit_screen(&webcam.ui_fb);
                                 }
                                 // the camera buffer is no longer needed: re-arm for the next band
                                 // (or the next frame) so it captures while this chunk goes out
@@ -1314,6 +1333,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                             webcam.dropped = 0;
                             webcam.restarts = 0;
                             let m = webcam.custom.unwrap_or(UVC_MODES[mode]);
+                            webcam.preview_fb.fill(0);
                             webcam_start_capture(
                                 &mut cam,
                                 &mut i2c,
@@ -1373,6 +1393,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                 webcam.settle = 0;
                                 webcam.frame_locked = false;
                                 let m = webcam.custom.unwrap_or(UVC_MODES[webcam.mode]);
+                                webcam.preview_fb.fill(0);
                                 webcam_start_capture(
                                     &mut cam,
                                     &mut i2c,
@@ -1404,7 +1425,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                     if a1 == 6 {
                         webcam.preview = a2 != 0;
                         if !webcam.preview {
-                            display.clear();
+                            // the UI's buffer is intact (the preview never painted it): show it
                             display
                                 .redraw()
                                 .unwrap_or_else(|_| display_timeout_handler(&udma_global, &mut display));
