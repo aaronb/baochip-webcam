@@ -282,9 +282,11 @@ pub struct UvcMode {
     pub interval: u32,
     /// image rows per UVC payload; payload data = rows * width * 2 bytes (at most 4800)
     pub payload_rows: usize,
-    /// image rows captured per sensor frame (the whole image for the small mode, a band of
-    /// it for the large ones, limited by the camera's IFRAM); a multiple of `payload_rows`
-    pub band_rows: usize,
+    /// image rows per DMA transfer: a frame is captured as a chain of transfers through a ring
+    /// of `UVC_RING_DEPTH` slots of this size in the camera's IFRAM, and each completed
+    /// transfer is handed to the USB service as one chunk. A multiple of `payload_rows`, at most
+    /// `UVC_CHUNK_PAYLOADS * payload_rows`.
+    pub slot_rows: usize,
 }
 
 #[allow(dead_code)] // the library target only needs the table
@@ -296,40 +298,41 @@ impl UvcMode {
     /// Pixels per captured line: the padded width
     pub const fn line_px(&self) -> usize { self.width + self.line_pad }
 
-    pub const fn bands(&self) -> usize { (self.height + self.band_rows - 1) / self.band_rows }
+    /// DMA transfers per frame
+    pub const fn transfers(&self) -> usize { (self.height + self.slot_rows - 1) / self.slot_rows }
 }
 
 /// The modes, in UVC frame-descriptor order (bFrameIndex = index + 1). Index 0 is the default.
 pub const UVC_MODES: [UvcMode; 3] = [
-    // 640x480 sensor window (the QR scanner's), 1/4: the low-latency mode, ~24 fps achieved
+    // 640x480 sensor window (the QR scanner's), 1/4: the low-latency mode, sensor ~37 fps
     UvcMode {
         width: 160,
         height: 120,
         ratio: 4,
         line_pad: 24,
-        interval: 666_666,
+        interval: 333_333,
         payload_rows: 15,
-        band_rows: 120,
+        slot_rows: 60,
     },
-    // 1568x1152 window, 1/4: nearly the full field of view, 2 bands per frame
+    // 1568x1152 window, 1/4: nearly the full field of view, sensor ~11 fps
     UvcMode {
         width: 384,
         height: 288,
         ratio: 4,
         line_pad: 8,
-        interval: 2_000_000,
+        interval: 833_333,
         payload_rows: 6,
-        band_rows: 144,
+        slot_rows: 48,
     },
-    // 1556x1154 window, 1/2: 8 bands per frame
+    // 1556x1154 window, 1/2, sensor ~11 fps
     UvcMode {
         width: 768,
         height: 576,
         ratio: 2,
         line_pad: 10,
-        interval: 5_000_000,
+        interval: 833_333,
         payload_rows: 3,
-        band_rows: 72,
+        slot_rows: 24,
     },
     // A full-resolution (ratio 1) mode is deliberately absent: the sensor's ratio-1 output is
     // not coherent through this camera DMA (see the note in Gc2145::init_window).
@@ -341,6 +344,11 @@ pub const UVC_MAX_PAYLOAD_DATA: usize = 4800;
 pub const UVC_CHUNK_PAYLOADS: usize = 8;
 /// Largest chunk in bytes (fits a 10-page buffer)
 pub const UVC_CHUNK_MAX_BYTES: usize = UVC_CHUNK_PAYLOADS * UVC_MAX_PAYLOAD_DATA;
+/// Slots in the capture ring (see `UvcMode::slot_rows`). The DMA channel holds two transfers,
+/// so with three slots the consumer has two slot times to copy one out before it is needed
+/// again, and the next frame's first two slots are never the one still being copied.
+#[allow(dead_code)] // the library target only needs the table
+pub const UVC_RING_DEPTH: usize = 3;
 
 /// Flags carried in the `offset` field of a `UvcSendFrame` lend, alongside the payload data
 /// size: `offset = flags | payload_data << 2`.

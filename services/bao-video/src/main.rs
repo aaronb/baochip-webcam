@@ -47,7 +47,7 @@ use num_traits::*;
 #[cfg(feature = "uvc")]
 use usb_bao1x::UvcMode;
 #[cfg(feature = "uvc")]
-use usb_bao1x::{UVC_CHUNK_PAYLOADS, UVC_MODES, UvcFrameResult};
+use usb_bao1x::{UVC_CHUNK_PAYLOADS, UVC_MODES, UVC_RING_DEPTH, UvcFrameResult};
 #[cfg(not(feature = "hosted-baosec"))]
 use utralib::utra;
 use ux_api::minigfx::{self, FrameBuffer};
@@ -215,12 +215,17 @@ struct WebcamState {
     /// a console-defined geometry for camera bring-up, used instead of `UVC_MODES[mode]` when set
     custom: Option<UvcMode>,
     /// band (group of rows captured per sensor frame) being captured
-    band: usize,
-    /// sensor frames to discard before the next frame starts, so that auto-exposure can adapt
-    /// between banded frames while being locked within one
-    settle: usize,
-    /// exposure was locked by the banded-capture logic (not by the user) for the current frame
-    frame_locked: bool,
+    /// per frame: DMA transfers queued and serviced so far
+    xfer_queued: usize,
+    xfer_done: usize,
+    /// ring slot of this frame's first transfer, and a running slot counter across frames
+    slot_base: usize,
+    slot_counter: usize,
+    /// frames abandoned because the ring ran dry before a slot was copied out
+    overruns: usize,
+    /// a UI flush arrived while the webcam was running: send the display's buffer to the
+    /// panel a few columns per transfer instead of in one 25 ms transfer
+    flush_pending: bool,
     /// sensor clock divider register (0xfa) to apply for ratio-1 geometries (bring-up knob)
     clkdiv_ratio1: u8,
     /// draw a dithered preview of the captured frames on the OLED
@@ -228,8 +233,8 @@ struct WebcamState {
     /// the preview's own framebuffer: the UI keeps painting the display's buffer while the
     /// webcam runs (the vault's idle screen is animated), so the preview cannot live there
     preview_fb: Vec<u32>,
-    /// the UI's framebuffer contents, held while the preview is swapped in for a transfer
-    ui_fb: Vec<u32>,
+    /// next panel column the incremental preview refresh will send
+    preview_col: usize,
     /// elapsed-ms timestamp of the last completed frame, for the preview's rate figure
     last_frame_ms: u64,
     /// frame rate in tenths of a frame per second, for the preview status line
@@ -264,14 +269,18 @@ impl WebcamState {
             crop_words: 3,
             mode: 0,
             custom: None,
-            band: 0,
-            settle: 0,
-            frame_locked: false,
+            xfer_queued: 0,
+            xfer_done: 0,
+            slot_base: 0,
+            slot_counter: 0,
+            overruns: 0,
+            flush_pending: false,
             clkdiv_ratio1: 0x19,
             first_session: true,
             preview: true,
-            preview_fb: vec![0u32; (bao1x_hal::sh1107::COLUMN * bao1x_hal::sh1107::ROW) as usize / 32],
-            ui_fb: vec![0u32; (bao1x_hal::sh1107::COLUMN * bao1x_hal::sh1107::ROW) as usize / 32],
+            // a set bit is a dark pixel: start black
+            preview_fb: vec![!0u32; (bao1x_hal::sh1107::COLUMN * bao1x_hal::sh1107::ROW) as usize / 32],
+            preview_col: 0,
             last_frame_ms: 0,
             fps_x10: 0,
             pinned: false,
@@ -336,16 +345,17 @@ fn webcam_start_capture(
     cam_pdwn: (IoxPort, u8),
     tt: &ticktimer::Ticktimer,
     udma_global: &UdmaGlobal,
-    mode: &UvcMode,
-    clkdiv_ratio1: u8,
+    webcam: &mut WebcamState,
 ) {
+    let mode = webcam.custom.unwrap_or(UVC_MODES[webcam.mode]);
+    let clkdiv_ratio1 = webcam.clkdiv_ratio1;
     udma_global.reset(PeriphId::Cam);
     camera_power_up(iox, timer, cam_clk, cam_pdwn, tt);
     let (pid, mid) = cam.read_id(i2c);
     log::info!("webcam: camera pid {:x}, mid {:x}", pid, mid);
-    // The sensor outputs the padded line width and one extra line; the DMA slicer picks the
-    // band of rows for each sensor frame (see `webcam_slice_band`), and the frame copy drops
-    // the 3 stale words at the start of every line (see the CamIrq handler).
+    // The sensor outputs the padded line width and one extra line; the DMA slicer passes the
+    // image rows, the ring takes them as a chain of transfers (see `webcam_ring_start_frame`),
+    // and the frame copy drops the 3 stale words at the start of every line.
     cam.init_window(i2c, mode.line_px() as u16, (mode.height + 1) as u16, mode.ratio);
     tt.sleep_ms(15).ok();
     // The init table enables the sensor's horizontal mirror only (P0 reg 0x17 bit 0, reads
@@ -364,19 +374,76 @@ fn webcam_start_capture(
         cam.poke(i2c, 0xfe, 0x00);
         cam.poke(i2c, 0xfa, clkdiv_ratio1);
     }
-    webcam_slice_band(cam, mode, 0);
-    cam.capture_async();
+    cam.set_slicing((0, 0), (mode.line_px(), mode.height + 1));
+    cam.set_sof_sync(false);
+    let ring = webcam_ring_geometry(cam, &mode);
+    if ring.transfers > 1 && ring.depth < 3 {
+        log::warn!(
+            "webcam: {}x{} ring has only {} slots; the frame re-arm waits for the last copy",
+            mode.width,
+            mode.height,
+            ring.depth
+        );
+    }
+    webcam_ring_start_frame(cam, &ring, webcam);
 }
 
-/// Point the DMA slicer at band `band` of the mode's image: `band_rows` rows (fewer for the last
-/// band) plus one extra, unreliable, row that the copy ignores. Returns the number of image rows
-/// in the band.
+/// How a mode's frame maps onto the camera IFRAM: a ring of `depth` slots of `slot_bytes`, and
+/// `transfers` DMA transfers per frame, each of `slot_rows` lines (the last may be shorter).
 #[cfg(feature = "uvc")]
-fn webcam_slice_band(cam: &mut Gc2145, mode: &UvcMode, band: usize) -> usize {
-    let y0 = band * mode.band_rows;
-    let rows = mode.band_rows.min(mode.height - y0);
-    cam.set_slicing((0, y0), (mode.line_px(), y0 + rows + 1));
-    rows
+#[derive(Clone, Copy)]
+struct RingGeometry {
+    slot_rows: usize,
+    height: usize,
+    line_bytes: usize,
+    slot_bytes: usize,
+    depth: usize,
+    transfers: usize,
+}
+
+#[cfg(feature = "uvc")]
+fn webcam_ring_geometry(cam: &Gc2145, mode: &UvcMode) -> RingGeometry {
+    let line_bytes = mode.line_px() * 2;
+    let slot_bytes = mode.slot_rows * line_bytes;
+    RingGeometry {
+        slot_rows: mode.slot_rows,
+        height: mode.height,
+        line_bytes,
+        slot_bytes,
+        depth: (cam.ifram_len() / slot_bytes).min(UVC_RING_DEPTH).max(1),
+        transfers: mode.transfers(),
+    }
+}
+
+/// Queue the frame's next transfer into the next ring slot.
+#[cfg(feature = "uvc")]
+fn webcam_ring_enqueue(cam: &mut Gc2145, ring: &RingGeometry, webcam: &mut WebcamState) {
+    let k = webcam.xfer_queued;
+    let rows = ring.slot_rows.min(ring.height - k * ring.slot_rows);
+    let slot = (webcam.slot_base + k) % ring.depth;
+    // safety: the slot lies inside the camera IFRAM (see `webcam_ring_geometry`), and slots are
+    // only re-queued after their previous contents were copied out
+    unsafe { cam.enqueue_rx(slot * ring.slot_bytes, rows * ring.line_bytes) };
+    webcam.xfer_queued += 1;
+}
+
+/// Start capturing a frame: stop the pixel pipeline, drop whatever the channel still held,
+/// queue the first two transfers, and enable the pipeline again so it starts at the next start
+/// of frame. Slots continue round the ring from frame to frame, so with three slots the frame
+/// after this one never lands in the slot that is still being copied out.
+#[cfg(feature = "uvc")]
+fn webcam_ring_start_frame(cam: &mut Gc2145, ring: &RingGeometry, webcam: &mut WebcamState) {
+    cam.pipeline_enable(false);
+    cam.dma_clear();
+    webcam.slot_base = webcam.slot_counter;
+    webcam.slot_counter += ring.transfers;
+    webcam.xfer_queued = 0;
+    webcam.xfer_done = 0;
+    webcam_ring_enqueue(cam, ring, webcam);
+    if ring.transfers > 1 {
+        webcam_ring_enqueue(cam, ring, webcam);
+    }
+    cam.pipeline_enable(true);
 }
 
 /// Preview geometry: pixels of the image per preview pixel (1 = crop), and the image offset so
@@ -429,21 +496,29 @@ fn webcam_preview_rows(fb: &mut [u32], src: &[u32], mode: &UvcMode, first_row: u
     }
 }
 
-/// Status line under the preview: size, exposure mode, frame rate.
+/// Status line under the preview: size, exposure mode, frame rate. The text renderer draws
+/// into a display, so it goes through the display's buffer and the status rows are then
+/// lifted into the preview framebuffer, leaving the display's buffer as it was.
 #[cfg(feature = "uvc")]
 fn webcam_preview_status(
     display: &mut Oled128x128,
     mode: &UvcMode,
-    webcam: &WebcamState,
+    exposure_mode: WebcamExposureMode,
+    fps_x10: u32,
+    preview_fb: &mut [u32],
     screen_size: Point,
 ) {
-    let exp = match webcam.exposure_mode {
+    let exp = match exposure_mode {
         WebcamExposureMode::Auto => 'A',
         WebcamExposureMode::Lock => 'L',
         WebcamExposureMode::Manual { .. } => 'M',
     };
-    let text =
-        format!("{}x{} {} {}.{}fps", mode.width, mode.height, exp, webcam.fps_x10 / 10, webcam.fps_x10 % 10);
+    let text = format!("{}x{} {} {}.{}fps", mode.width, mode.height, exp, fps_x10 / 10, fps_x10 % 10);
+    let words_per_row = bao1x_hal::sh1107::COLUMN as usize / 32;
+    let lo = PREVIEW_ROWS * words_per_row;
+    let hi = display.buffer().len();
+    let mut saved = [0u32; 64];
+    saved[..hi - lo].copy_from_slice(&display.buffer()[lo..hi]);
     gfx::msg(
         display,
         &text,
@@ -453,6 +528,18 @@ fn webcam_preview_status(
         false,
         screen_size,
     );
+    preview_fb[lo..hi].copy_from_slice(&display.buffer()[lo..hi]);
+    display.buffer_mut()[lo..hi].copy_from_slice(&saved[..hi - lo]);
+}
+
+/// Panel columns (16-byte pages) the incremental preview refresh sends per serviced transfer:
+/// enough to refresh the screen about every other frame, within limits, since each column costs
+/// about 0.2 ms of SPI time out of a slot's budget.
+#[cfg(feature = "uvc")]
+const PREVIEW_COLS: usize = bao1x_hal::sh1107::COLUMN as usize;
+#[cfg(feature = "uvc")]
+fn preview_cols_per_step(transfers: usize) -> usize {
+    ((PREVIEW_COLS + 2 * transfers - 1) / (2 * transfers)).clamp(4, 16)
 }
 
 /// Schedule a `WebcamWatchdog` check: if no frame has arrived by then, the camera is restarted.
@@ -942,83 +1029,101 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                 GfxOpcode::CamIrq => {
                     #[cfg(feature = "uvc")]
                     if webcam.active {
-                        // One sensor frame has landed: the whole image for the small mode, or one
-                        // band of it for the large ones. Copy it out of the camera IFRAM (uncached,
-                        // slow to read) in chunks, hand each chunk to the USB service, and re-arm
-                        // the capture for the next band or frame. The USB call blocks until the
-                        // chunk has gone out, or is discarded because the host isn't streaming.
+                        // The frame arrives as a chain of DMA transfers through a ring of slots
+                        // in the camera IFRAM (see `webcam_ring_start_frame`). Each completed
+                        // transfer is copied out (IFRAM is uncached and slow to read), dithered
+                        // into the preview and handed to the USB service as one chunk, and its
+                        // slot is queued again two transfers ahead. The USB call blocks until
+                        // the previous chunk has gone out (about 1 ms), or returns at once when
+                        // the host isn't streaming.
                         let mode = webcam.custom.unwrap_or(UVC_MODES[webcam.mode]);
-                        let bands = mode.bands();
-                        let band = webcam.band;
-                        let first_band = band == 0;
-                        let last_band = band + 1 == bands;
-                        let rows = mode.band_rows.min(mode.height - band * mode.band_rows);
-                        webcam.captured += 1;
-
-                        if webcam.settle > 0 {
-                            // discarding sensor frames so auto-exposure can adapt between frames
-                            webcam.settle -= 1;
-                            cam.capture_async();
-                            continue;
-                        }
-                        if webcam.first_session && webcam.captured >= 4 {
-                            // see `first_session`: restart the camera once, then carry on
-                            webcam.first_session = false;
-                            log::info!("webcam: restarting the first session after boot");
-                            camera_power_down(&iox, &mut timer, cam_clk, cam_pdwn, &tt);
-                            webcam.band = 0;
-                            webcam.frame_locked = false;
-                            webcam.exposure_applied = false;
-                            let m = webcam.custom.unwrap_or(UVC_MODES[webcam.mode]);
-                            webcam.preview_fb.fill(0);
-                            webcam_start_capture(
-                                &mut cam,
-                                &mut i2c,
-                                &iox,
-                                &mut timer,
-                                cam_clk,
-                                cam_pdwn,
-                                &tt,
-                                &udma_global,
-                                &m,
-                                webcam.clkdiv_ratio1,
-                            );
-                            continue;
-                        }
-                        if first_band {
-                            // User lock: wait for the automatic engines to settle (about 20
-                            // frames); manual settings are applied at start.
-                            if !webcam.exposure_applied
+                        let ring = webcam_ring_geometry(&cam, &mode);
+                        let src_words = mode.line_px() * 2 / core::mem::size_of::<u32>();
+                        let dst_words = mode.width * 2 / core::mem::size_of::<u32>();
+                        let crop = webcam.crop_words.min(src_words - dst_words);
+                        loop {
+                            let outstanding = webcam.xfer_queued - webcam.xfer_done;
+                            if outstanding == 0 {
+                                break;
+                            }
+                            let (active, shadow) = cam.dma_state();
+                            let completed = if !active {
+                                outstanding
+                            } else if shadow {
+                                0
+                            } else {
+                                outstanding - 1
+                            };
+                            if completed == 0 {
+                                break;
+                            }
+                            if completed >= 2 && webcam.xfer_queued < ring.transfers {
+                                // Both queued transfers finished before this ran: the ring ran
+                                // dry and pixels went nowhere. Abandon the frame (the host drops
+                                // it when the next frame's ID toggles) and start over at the next
+                                // start of frame.
+                                webcam.overruns += 1;
+                                webcam.dropped += 1;
+                                if webcam.overruns.is_power_of_two() {
+                                    log::warn!(
+                                        "webcam: ring overrun at transfer {} of {} ({} so far)",
+                                        webcam.xfer_done,
+                                        ring.transfers,
+                                        webcam.overruns
+                                    );
+                                }
+                                webcam_ring_start_frame(&mut cam, &ring, &mut webcam);
+                                break;
+                            }
+                            let k = webcam.xfer_done;
+                            let first = k == 0;
+                            let last = k + 1 == ring.transfers;
+                            let rows = ring.slot_rows.min(ring.height - k * ring.slot_rows);
+                            let slot = (webcam.slot_base + k) % ring.depth;
+                            webcam.xfer_done += 1;
+                            if first
+                                && !webcam.exposure_applied
                                 && webcam.exposure_mode == WebcamExposureMode::Lock
                                 && webcam.captured >= 20
                             {
+                                // User lock: wait for the automatic engines to settle (about 20
+                                // frames); manual settings are applied at start.
                                 webcam.exposure = cam.lock_exposure(&mut i2c);
                                 webcam.exposure_applied = true;
                                 log::info!("webcam: exposure locked at {:?}", webcam.exposure);
                             }
-                            // Banded frames: hold exposure and white balance for the whole frame
-                            // so the bands match, unless the user already fixed them.
-                            if bands > 1 && webcam.exposure_mode == WebcamExposureMode::Auto {
-                                webcam.exposure = cam.lock_exposure(&mut i2c);
-                                webcam.frame_locked = true;
+                            // Keep the channel fed. With three slots the one two transfers ahead
+                            // was copied out last time, so it can be queued before this copy;
+                            // with fewer it is this slot, so it waits for the copy.
+                            if ring.depth >= 3 && webcam.xfer_queued < ring.transfers {
+                                webcam_ring_enqueue(&mut cam, &ring, &mut webcam);
                             }
-                        }
-
-                        let src_words = mode.line_px() * 2 / core::mem::size_of::<u32>();
-                        let dst_words = mode.width * 2 / core::mem::size_of::<u32>();
-                        let crop = webcam.crop_words.min(src_words - dst_words);
-                        let chunk_rows = UVC_CHUNK_PAYLOADS * mode.payload_rows;
-                        let mut row = 0;
-                        while row < rows {
-                            let n = chunk_rows.min(rows - row);
+                            if last {
+                                webcam.captured += 1;
+                                let now = tt.elapsed_ms();
+                                let dt = now.saturating_sub(webcam.last_frame_ms).max(1);
+                                webcam.fps_x10 = (10_000 / dt) as u32;
+                                webcam.last_frame_ms = now;
+                                if ring.depth >= 3 {
+                                    // re-arm inside the vertical blanking, before the copy: the
+                                    // next frame's first slots are not the one being copied
+                                    webcam_ring_start_frame(&mut cam, &ring, &mut webcam);
+                                }
+                            }
                             {
-                                // borrow the camera buffer only for the copy: the re-arm below
-                                // needs the camera mutably
                                 let fb: &[u32] = cam.rx_buf_unskipped();
+                                let base = slot * ring.slot_bytes / core::mem::size_of::<u32>();
                                 let dst = unsafe { webcam.frame.as_slice_mut::<u32>() };
-                                for r in 0..n {
-                                    let src = &fb[(row + r) * src_words + crop..][..dst_words];
+                                for r in 0..rows {
+                                    let src = &fb[base + r * src_words + crop..][..dst_words];
                                     dst[r * dst_words..][..dst_words].copy_from_slice(src);
+                                }
+                            }
+                            if ring.depth < 3 {
+                                if webcam.xfer_queued < ring.transfers {
+                                    webcam_ring_enqueue(&mut cam, &ring, &mut webcam);
+                                } else if last {
+                                    webcam_ring_start_frame(&mut cam, &ring, &mut webcam);
                                 }
                             }
                             if webcam.preview {
@@ -1027,48 +1132,13 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                     &mut webcam.preview_fb,
                                     src,
                                     &mode,
-                                    band * mode.band_rows + row,
-                                    n,
+                                    k * ring.slot_rows,
+                                    rows,
                                 );
-                            }
-                            let first = first_band && row == 0;
-                            let last = last_band && row + n >= rows;
-                            if row + n >= rows {
-                                if webcam.preview {
-                                    if last_band {
-                                        let now = tt.elapsed_ms();
-                                        let dt = now.saturating_sub(webcam.last_frame_ms).max(1);
-                                        webcam.fps_x10 = (10_000 / dt) as u32;
-                                        webcam.last_frame_ms = now;
-                                    }
-                                    // swap the preview in for the transfer only, so the UI's
-                                    // buffer is left as the UI last painted it
-                                    webcam.ui_fb.copy_from_slice(display.buffer());
-                                    display.blit_screen(&webcam.preview_fb);
-                                    webcam_preview_status(&mut display, &mode, &webcam, screen_size);
-                                    display.draw().unwrap_or_else(|_| {
-                                        display_timeout_handler(&udma_global, &mut display)
-                                    });
-                                    display.blit_screen(&webcam.ui_fb);
-                                }
-                                // the camera buffer is no longer needed: re-arm for the next band
-                                // (or the next frame) so it captures while this chunk goes out
-                                if last_band {
-                                    if webcam.frame_locked {
-                                        cam.unlock_exposure(&mut i2c);
-                                        webcam.frame_locked = false;
-                                        webcam.settle = 2;
-                                    }
-                                    webcam.band = 0;
-                                } else {
-                                    webcam.band = band + 1;
-                                }
-                                webcam_slice_band(&mut cam, &mode, webcam.band);
-                                cam.capture_async();
                             }
                             match usb.uvc_send_chunk(
                                 webcam.frame,
-                                n * mode.width * 2,
+                                rows * mode.width * 2,
                                 mode.payload_data(),
                                 first,
                                 last,
@@ -1092,7 +1162,54 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                     webcam.dropped += 1;
                                 }
                             }
-                            row += n;
+                            // The panel gets a few columns per transfer: a whole screen takes
+                            // ~25 ms over SPI, several times a slot's budget. With the preview
+                            // on that is the preview; otherwise it is the UI's own buffer,
+                            // whenever the UI has asked for a flush.
+                            if webcam.preview || webcam.flush_pending {
+                                if webcam.preview && last {
+                                    webcam_preview_status(
+                                        &mut display,
+                                        &mode,
+                                        webcam.exposure_mode,
+                                        webcam.fps_x10,
+                                        &mut webcam.preview_fb,
+                                        screen_size,
+                                    );
+                                }
+                                let col = webcam.preview_col;
+                                let n = preview_cols_per_step(ring.transfers).min(PREVIEW_COLS - col);
+                                if webcam.preview {
+                                    display.draw_columns(&webcam.preview_fb, col, n)
+                                } else {
+                                    display.draw_own_columns(col, n)
+                                }
+                                .unwrap_or_else(|_| display_timeout_handler(&udma_global, &mut display));
+                                webcam.preview_col = (col + n) % PREVIEW_COLS;
+                                if webcam.preview_col == 0 && !webcam.preview {
+                                    webcam.flush_pending = false;
+                                }
+                            }
+                            if last && webcam.first_session && webcam.captured >= 4 {
+                                // see `first_session`: restart the camera once, then carry on
+                                webcam.first_session = false;
+                                log::info!("webcam: restarting the first session after boot");
+                                camera_power_down(&iox, &mut timer, cam_clk, cam_pdwn, &tt);
+                                webcam.exposure_applied = false;
+                                webcam.preview_fb.fill(!0);
+                                webcam_start_capture(
+                                    &mut cam,
+                                    &mut i2c,
+                                    &iox,
+                                    &mut timer,
+                                    cam_clk,
+                                    cam_pdwn,
+                                    &tt,
+                                    &udma_global,
+                                    &mut webcam,
+                                );
+                                break;
+                            }
                         }
                         continue;
                     }
@@ -1289,9 +1406,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                         let (w, h) = (arg3 >> 16, arg3 & 0xffff);
                         let (ratio, pad) = ((arg4 >> 8) as u16, arg4 & 0xff);
                         let payload_rows = (4800 / (w * 2)).max(1);
-                        let per_band = 122_880 / ((w + pad) * 2) - 1;
-                        let band_rows =
-                            (per_band / payload_rows * payload_rows).clamp(payload_rows, h.max(payload_rows));
+                        let slot_rows = (UVC_CHUNK_PAYLOADS * payload_rows).min(h.max(payload_rows));
                         Some(UvcMode {
                             width: w,
                             height: h,
@@ -1299,7 +1414,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                             line_pad: pad,
                             interval: 10_000_000,
                             payload_rows,
-                            band_rows,
+                            slot_rows,
                         })
                     } else {
                         None
@@ -1330,15 +1445,12 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                             if let Some(m) = raw {
                                 log::info!("webcam: raw geometry {:?}", m);
                             }
-                            webcam.band = 0;
-                            webcam.settle = 0;
-                            webcam.frame_locked = false;
                             webcam.captured = 0;
                             webcam.sent = 0;
                             webcam.dropped = 0;
+                            webcam.overruns = 0;
                             webcam.restarts = 0;
-                            let m = webcam.custom.unwrap_or(UVC_MODES[mode]);
-                            webcam.preview_fb.fill(0);
+                            webcam.preview_fb.fill(!0);
                             webcam_start_capture(
                                 &mut cam,
                                 &mut i2c,
@@ -1348,8 +1460,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                 cam_pdwn,
                                 &tt,
                                 &udma_global,
-                                &m,
-                                webcam.clkdiv_ratio1,
+                                &mut webcam,
                             );
                             webcam.exposure_applied = false;
                             if let WebcamExposureMode::Manual { exposure, pregain, postgain } =
@@ -1394,11 +1505,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                     RESTART_LIMIT
                                 );
                                 camera_power_down(&iox, &mut timer, cam_clk, cam_pdwn, &tt);
-                                webcam.band = 0;
-                                webcam.settle = 0;
-                                webcam.frame_locked = false;
-                                let m = webcam.custom.unwrap_or(UVC_MODES[webcam.mode]);
-                                webcam.preview_fb.fill(0);
+                                webcam.preview_fb.fill(!0);
                                 webcam_start_capture(
                                     &mut cam,
                                     &mut i2c,
@@ -1408,8 +1515,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                     cam_pdwn,
                                     &tt,
                                     &udma_global,
-                                    &m,
-                                    webcam.clkdiv_ratio1,
+                                    &mut webcam,
                                 );
                                 webcam_arm_watchdog(cid, webcam.captured, &tt);
                             } else {
@@ -1429,11 +1535,16 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                     };
                     if a1 == 6 {
                         webcam.preview = a2 != 0;
+                        webcam.preview_col = 0;
                         if !webcam.preview {
                             // the UI's buffer is intact (the preview never painted it): show it
-                            display
-                                .redraw()
-                                .unwrap_or_else(|_| display_timeout_handler(&udma_global, &mut display));
+                            if webcam.active {
+                                webcam.flush_pending = true;
+                            } else {
+                                display
+                                    .redraw()
+                                    .unwrap_or_else(|_| display_timeout_handler(&udma_global, &mut display));
+                            }
                         }
                         if let Some(scalar) = msg.body.scalar_message_mut() {
                             scalar.arg1 = 1;
@@ -1617,7 +1728,17 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                 GfxOpcode::Flush => {
                     if qr_request.is_none() && !preview_owns_screen {
                         log::trace!("***gfx flush*** redraw##");
-                        if !dry_run {
+                        // While the webcam runs, a 25 ms full transfer here would stall the
+                        // capture ring; the webcam path sends the screen a few columns at a time.
+                        #[cfg(feature = "uvc")]
+                        let deferred = webcam.active;
+                        #[cfg(not(feature = "uvc"))]
+                        let deferred = false;
+                        #[cfg(feature = "uvc")]
+                        if deferred {
+                            webcam.flush_pending = true;
+                        }
+                        if !deferred && !dry_run {
                             display
                                 .redraw()
                                 .unwrap_or_else(|_| display_timeout_handler(&udma_global, &mut display));

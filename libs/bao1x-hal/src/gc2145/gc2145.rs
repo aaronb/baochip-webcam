@@ -410,6 +410,47 @@ impl Gc2145 {
         }
     }
 
+    // ---- Ring capture: a frame as a chain of DMA transfers ----------------------------------
+    //
+    // The receive channel queues two transfers, one active and one shadow. With `CFG_SOF_SYNC`
+    // clear an enqueue takes effect at once (with it set, every enqueue is held until the next
+    // start of frame, so chained transfers would come from successive frames). The pixel
+    // pipeline (`CFG_GLOB_EN`) only starts at a start of frame and stops as soon as it is
+    // cleared, so a frame is delimited by toggling it around a chain of transfers.
+
+    /// Enable or disable the pixel pipeline. Enabling takes effect at the next start of frame;
+    /// disabling is immediate.
+    pub fn pipeline_enable(&mut self, en: bool) { self.csr.rmwf(CFG_GLOB_EN, en as u32); }
+
+    /// Hold DMA enqueues until the next start of frame (`capture_async` relies on this being
+    /// set; the ring capture clears it).
+    pub fn set_sof_sync(&mut self, en: bool) { self.csr.rmwf(CFG_SOF_SYNC, en as u32); }
+
+    /// Stop and discard any queued receive transfers.
+    pub fn dma_clear(&mut self) { self.udma_reset(Bank::Rx); }
+
+    /// `(transfer loaded, shadow transfer queued)` for the receive channel, from the channel's
+    /// CFG readback. "Loaded" holds from the enqueue until the transfer has drained, including
+    /// the time a queued transfer waits for the pipeline to start at a start of frame (the
+    /// address readback `udma_busy` relies on stays zero until then).
+    pub fn dma_state(&self) -> (bool, bool) {
+        // safety: reads a register of this peripheral's own DMA channel
+        let cfg = unsafe { self.csr().base().add(Bank::Rx as usize).add(DmaReg::Cfg.into()).read_volatile() };
+        (cfg & CFG_EN != 0, cfg & CFG_SHADOW != 0)
+    }
+
+    /// Length in bytes of the camera's IFRAM.
+    pub fn ifram_len(&self) -> usize { self.ifram.as_ref().map(|i| i.as_slice::<u8>().len()).unwrap_or(0) }
+
+    /// Queue a receive transfer of `len` bytes into the camera IFRAM, `offset` bytes in.
+    ///
+    /// Safety: the range must lie inside the camera IFRAM, and its contents belong to the DMA
+    /// until the transfer completes.
+    pub unsafe fn enqueue_rx(&mut self, offset: usize, len: usize) {
+        let buf = &self.rx_buf_phys::<u8>()[offset..offset + len];
+        self.udma_enqueue(Bank::Rx, buf, CFG_EN | CFG_SIZE_16);
+    }
+
     pub fn resolution(&self) -> (usize, usize) {
         if let Some((x, y)) = self.slicing { (x, y) } else { self.dims }
     }

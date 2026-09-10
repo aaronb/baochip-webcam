@@ -432,6 +432,57 @@ impl<'a> Oled128x128<'a> {
 
     pub fn stash(&mut self) { self.stash.copy_from_slice(&self.buffer); }
 
+    /// Send columns `first..first + count` of `src` (an image in this display's framebuffer
+    /// layout) to the panel, leaving the rest of the panel and this display's own buffer
+    /// untouched. A full refresh takes about 25 ms over SPI; this lets a caller spread one
+    /// over many small steps.
+    pub fn draw_columns(&mut self, src: &[u32], first: usize, count: usize) -> Result<(), xous::Error> {
+        let words = 16 / size_of::<u32>();
+        let last = (first + count).min(self.pages());
+        for page in first..last {
+            self.hw_buf[page * words..(page + 1) * words]
+                .copy_from_slice(&src[page * words..(page + 1) * words]);
+        }
+        self.send_columns(first, last)
+    }
+
+    /// `draw_columns` from this display's own buffer: a full `draw` spread over steps.
+    pub fn draw_own_columns(&mut self, first: usize, count: usize) -> Result<(), xous::Error> {
+        let words = 16 / size_of::<u32>();
+        let last = (first + count).min(self.pages());
+        for page in first..last {
+            self.hw_buf[page * words..(page + 1) * words]
+                .copy_from_slice(&self.buffer[page * words..(page + 1) * words]);
+        }
+        self.send_columns(first, last)
+    }
+
+    /// Panel columns (16-byte pages) in a frame.
+    pub fn pages(&self) -> usize { self.buffer.len() * size_of::<u32>() / 16 }
+
+    fn send_columns(&mut self, first: usize, last: usize) -> Result<(), xous::Error> {
+        if self.powerdown {
+            return Ok(());
+        }
+        let chunk_size = 16;
+        for page in first..last {
+            self.send_command(Command::SetPageAddress(0).encode())?;
+            self.send_command(Command::SetColumnAddress(page as u8).encode())?;
+            self.set_data();
+            // safety: data is already copied into the DMA buffer. size & len are in bounds.
+            unsafe {
+                self.spim
+                    .txrx_data_async_from_parts::<u8>(page * chunk_size, chunk_size, true, false)
+                    .expect("Couldn't initiate oled data transfer");
+            }
+            self.spim.txrx_await(false).inspect_err(|_| {
+                #[cfg(feature = "std")]
+                log::error!("timeout in send_columns");
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn pop(&mut self) -> Result<(), xous::Error> {
         self.buffer.copy_from_slice(&self.stash);
         self.redraw()
