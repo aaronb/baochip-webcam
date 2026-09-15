@@ -208,7 +208,10 @@ struct WebcamState {
     sent: usize,
     dropped: usize,
     restarts: usize,
-    /// words to skip at the start of every captured line (the stale pipeline prefix)
+    /// 32-bit words the frame copy skips at the start of every captured line. 0: the ring
+    /// capture restarts the pipeline every frame, and lines start on the sensor's first pixel
+    /// (measured 2026-09-15 at 768x576 and 160x120 on scenes with a dark right edge); the 3-word
+    /// stale prefix measured with the earlier free-running capture is gone.
     crop_words: usize,
     /// index into `UVC_MODES` of the mode being captured
     mode: usize,
@@ -296,7 +299,7 @@ impl WebcamState {
             sent: 0,
             dropped: 0,
             restarts: 0,
-            crop_words: 3,
+            crop_words: 0,
             mode: 0,
             custom: None,
             xfer_queued: 0,
@@ -408,7 +411,7 @@ fn webcam_start_capture(
     log::info!("webcam: camera pid {:x}, mid {:x}", pid, mid);
     // The sensor outputs the padded line width and one extra line; the DMA slicer passes the
     // image rows, the ring takes them as a chain of transfers (see `webcam_ring_start_frame`),
-    // and the frame copy drops the 3 stale words at the start of every line.
+    // and the frame copy takes one image width from each line (see `WebcamState::crop_words`).
     cam.init_window(i2c, mode.line_px() as u16, (mode.height + 1) as u16, mode.ratio);
     log::info!(
         "webcam: {}x{} 1/{}: row {} ns, frame {} rows ({} us), anti-flicker for {} Hz",
@@ -1796,6 +1799,15 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                 level
                             );
                         }
+                        if let Some(scalar) = msg.body.scalar_message_mut() {
+                            scalar.arg1 = 1;
+                        }
+                        continue;
+                    }
+                    if a1 == 10 {
+                        // bring-up: 32-bit words the frame copy skips at the start of every line
+                        webcam.crop_words = a2;
+                        log::info!("webcam: per-line crop {} words", webcam.crop_words);
                         if let Some(scalar) = msg.body.scalar_message_mut() {
                             scalar.arg1 = 1;
                         }

@@ -16,7 +16,7 @@ impl<'a> ShellCmdApi<'a> for Webcam {
     fn process(&mut self, args: String, env: &mut CommonEnv) -> Result<Option<String>, xous::Error> {
         use core::fmt::Write;
         let mut ret = String::new();
-        let helpstring = "webcam [on [mode]|off|status|preview off|on|zoom|auto|lock|exposure <ms> [pregain] [postgain]|flicker 50|60|wb auto|cal|<r> <g> <b>|tp <pattern>|rotate on|off|usbreset]\nmodes: 0 768x576, 1 384x288, 2 160x120";
+        let helpstring = "webcam [on [mode]|off|status|preview off|on|zoom|auto|lock|exposure <ms> [pregain] [postgain]|flicker 50|60|wb auto|cal|<r> <g> <b>|tp <pattern>|rotate on|off|usbreset|crop <words>]\nmodes: 0 768x576, 1 384x288, 2 160x120";
         let mut tokens = args.split_whitespace();
         let gfx = ux_api::service::gfx::Gfx::new(&env.xns).unwrap();
         match tokens.next() {
@@ -177,6 +177,13 @@ impl<'a> ShellCmdApi<'a> for Webcam {
                     Err(e) => write!(ret, "error: {:?}", e).ok(),
                 },
                 _ => write!(ret, "usage: webcam flicker 50|60").ok(),
+            },
+            Some("crop") => match tokens.next().and_then(|t| t.parse::<usize>().ok()) {
+                Some(words) => match gfx.webcam_tune(10, words, 0, 0) {
+                    Ok(_) => write!(ret, "per-line crop {} words ({} samples)", words, words * 2).ok(),
+                    Err(e) => write!(ret, "error: {:?}", e).ok(),
+                },
+                None => write!(ret, "usage: webcam crop <words> (bring-up, default 0)").ok(),
             },
             Some("clkdiv") => {
                 let v = tokens.next().and_then(|t| {

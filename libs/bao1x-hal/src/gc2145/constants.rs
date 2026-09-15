@@ -15,9 +15,11 @@ pub(crate) const GC2145_REG_OUTPUT_FMT: u8 = 0x84;
 pub(crate) const GC2145_REG_OUTPUT_FMT_MASK: u8 = 0x1F;
 pub(crate) const GC2145_REG_OUTPUT_FMT_RGB565: u8 = 0x06;
 pub(crate) const GC2145_REG_OUTPUT_FMT_YCBYCR: u8 = 0x02;
-/// Y Cr Y Cb. On this board the capture path lands the chroma pair swapped relative to the
-/// sensor's byte order (measured with the sensor's colour test pattern: YCbYCr came out with
-/// red and blue exchanged), so this is the order that reaches the host as true UYVY.
+/// The datasheet's "Y Cr Y Cb", but this part emits Y Cb Y Cr for it, and Y Cr Y Cb for 0x02
+/// (measured 2026-09-15 with the uniform red test pattern: Cb on the even samples of every line
+/// for 0x03, Cr for 0x02, unchanged by moving the output crop a column). The capture interface
+/// keeps each (Y, chroma) byte pair in order and lines start on the first pixel, so 0x03 is what
+/// reaches the host as UYVY.
 pub(crate) const GC2145_REG_OUTPUT_FMT_YCRYCB: u8 = 0x03;
 pub(crate) const GC2145_REG_SYNC_MODE: u8 = 0x86;
 pub(crate) const GC2145_REG_SYNC_MODE_DEF: u8 = 0x23;

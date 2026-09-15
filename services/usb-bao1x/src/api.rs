@@ -271,9 +271,9 @@ impl TryFrom<usize> for LogLevel {
 // ---- UVC (USB video class) ----
 /// A video mode offered to the host: one UVC frame descriptor each. Pixel format is always
 /// UYVY (2 bytes per pixel). The sensor reads a centred `(width + line_pad) * ratio` by
-/// `(height + 1) * ratio` window and sub-samples it by `ratio`; the pad covers the 6-px stale
-/// prefix the camera DMA puts at the start of every line plus the sensor's dark dummy columns,
-/// and the extra line covers the unreliable last captured line.
+/// `(height + 1) * ratio` window and sub-samples it by `ratio`; the pad covers the sensor's dark
+/// last columns (the frame copy takes the first `width` samples of each line), and the extra
+/// line covers the unreliable last captured line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UvcMode {
     pub width: usize,

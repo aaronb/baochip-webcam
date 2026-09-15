@@ -70,10 +70,11 @@ impl Udma for Gc2145 {
 }
 
 impl Gc2145 {
-    /// Extra columns captured per line for `Resolution::Res160x120`. The first 3 words (6 px) of
-    /// every captured line are stale pipeline carry-over, and the sensor's last few columns
-    /// come out dark, so the consumer takes one image width starting 3 words into each line
-    /// (see bao-video's webcam path). Word-aligned (24 px = 48 bytes).
+    /// Extra columns captured per line for `Resolution::Res160x120`: the sensor's last few
+    /// columns come out dark, and free-running capture (`capture_async`) shows the first 3
+    /// words (6 px) of every line as stale pipeline carry-over. The webcam's ring capture
+    /// restarts the pipeline every frame and has no carry-over (measured 2026-09-15), so it
+    /// copies one image width from the start of each line. Word-aligned (24 px = 48 bytes).
     pub const LINE_PAD: usize = 24;
 
     #[cfg(feature = "std")]
@@ -409,10 +410,10 @@ impl Gc2145 {
             Resolution::Res160x120 => 4u16,
             _ => 2u16,
         };
-        // Full-frame capture (no slicing) shows the first ~6 pixels of every line as stale
-        // pipeline carry-over, the sensor's dummy columns come out dark, and the last captured
-        // line is unreliable. Capture `LINE_PAD` extra columns and one extra line and let the
-        // caller slice/skip them (see `Self::LINE_PAD`).
+        // Free-running full-frame capture (no slicing) shows the first ~6 pixels of every line as
+        // stale pipeline carry-over, the sensor's dummy columns come out dark, and the last
+        // captured line is unreliable. Capture `LINE_PAD` extra columns and one extra line and
+        // let the caller slice/skip them (see `Self::LINE_PAD`).
         let (line_w, lines) = match resolution {
             Resolution::Res160x120 => (w + Self::LINE_PAD, h + 1),
             _ => (w, h),
