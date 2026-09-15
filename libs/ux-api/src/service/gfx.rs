@@ -799,8 +799,8 @@ impl Gfx {
         let (a1, a2, a3, a4) = match mode {
             WebcamExposureMode::Auto => (0, 0, 0, 0),
             WebcamExposureMode::Lock => (1, 0, 0, 0),
-            WebcamExposureMode::Manual { exposure, pregain, postgain } => {
-                (2, exposure as usize, pregain as usize, postgain as usize)
+            WebcamExposureMode::Manual { exposure_us, pregain, postgain } => {
+                (2, exposure_us as usize, pregain as usize, postgain as usize)
             }
         };
         match send_message(
@@ -903,7 +903,7 @@ impl Gfx {
                 wb_mode: ((mode >> 4) & 0xf) as u8,
                 preview: ((mode >> 8) & 0xf) as u8,
                 rotate: (mode >> 12) & 1 != 0,
-                exposure: exposure as u16,
+                exposure_us: exposure as u32,
                 pregain: (gains >> 8) as u8,
                 postgain: gains as u8,
                 awb: [(awb >> 16) as u8, (awb >> 8) as u8, awb as u8],

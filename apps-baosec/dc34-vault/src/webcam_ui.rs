@@ -20,10 +20,15 @@ use ux_api::service::gfx::Gfx;
 
 /// PDDB key (in `DC34_DICT`) holding the saved webcam settings
 const DC34_WEBCAM: &str = "webcam";
-const SETTINGS_VERSION: u8 = 2;
-const SETTINGS_LEN: usize = 12;
-/// version 1 had no rotation byte
+const SETTINGS_VERSION: u8 = 3;
+const SETTINGS_LEN: usize = 14;
+/// version 2 stored the exposure as two bytes of sensor rows
+const SETTINGS_LEN_V2: usize = 12;
+/// version 1 also had no rotation byte
 const SETTINGS_LEN_V1: usize = 11;
+/// Versions 1 and 2 stored the exposure in sensor rows, whose duration depends on the video
+/// mode; they were saved in the default 768x576 mode almost always, where a row is 68.5 us.
+const LEGACY_ROW_NS: u64 = 68_529;
 
 /// Menu actions, carried as the scalar payload of `VaultOp::WebcamMenu`
 pub const MENU_EXPOSURE_AUTO: usize = 0;
@@ -57,7 +62,8 @@ const REDRAW_MS: u64 = 1000;
 struct Settings {
     /// 0 auto, 2 manual
     exp_mode: u8,
-    exposure: u16,
+    /// exposure time in microseconds
+    exposure_us: u32,
     pregain: u8,
     postgain: u8,
     /// 0 sensor auto, 1 manual gains
@@ -72,7 +78,7 @@ impl Settings {
     fn from_status(e: &WebcamExposureStatus, view: u8) -> Settings {
         Settings {
             exp_mode: if e.mode == 0 { 0 } else { 2 },
-            exposure: e.exposure,
+            exposure_us: e.exposure_us,
             pregain: e.pregain,
             postgain: e.postgain,
             wb_mode: if e.wb_mode == 0 { 0 } else { 1 },
@@ -83,11 +89,14 @@ impl Settings {
     }
 
     fn to_bytes(&self) -> [u8; SETTINGS_LEN] {
+        let e = self.exposure_us.to_le_bytes();
         [
             SETTINGS_VERSION,
             self.exp_mode,
-            self.exposure as u8,
-            (self.exposure >> 8) as u8,
+            e[0],
+            e[1],
+            e[2],
+            e[3],
             self.pregain,
             self.postgain,
             self.wb_mode,
@@ -100,22 +109,34 @@ impl Settings {
     }
 
     fn from_bytes(b: &[u8]) -> Option<Settings> {
-        let v1 = b.len() == SETTINGS_LEN_V1 && b[0] == 1;
-        if !v1 && (b.len() != SETTINGS_LEN || b[0] != SETTINGS_VERSION) {
-            return None;
-        }
+        let version = match (b.len(), b.first()) {
+            (SETTINGS_LEN, Some(&SETTINGS_VERSION)) => 3,
+            (SETTINGS_LEN_V2, Some(&2)) => 2,
+            (SETTINGS_LEN_V1, Some(&1)) => 1,
+            _ => return None,
+        };
+        // version 3 widened the exposure from two bytes of rows to four bytes of microseconds
+        let (exposure_us, rest) = if version == 3 {
+            (u32::from_le_bytes([b[2], b[3], b[4], b[5]]), &b[6..])
+        } else {
+            let rows = u16::from_le_bytes([b[2], b[3]]) as u64;
+            ((rows * LEGACY_ROW_NS / 1000) as u32, &b[4..])
+        };
         Some(Settings {
             exp_mode: b[1],
-            exposure: u16::from_le_bytes([b[2], b[3]]),
-            pregain: b[4],
-            postgain: b[5],
-            wb_mode: b[6],
-            wb: [b[7], b[8], b[9]],
-            view: b[10].min(VIEW_ZOOM),
-            rotate: !v1 && b[11] != 0,
+            exposure_us,
+            pregain: rest[0],
+            postgain: rest[1],
+            wb_mode: rest[2],
+            wb: [rest[3], rest[4], rest[5]],
+            view: rest[6].min(VIEW_ZOOM),
+            rotate: version > 1 && rest[7] != 0,
         })
     }
 }
+
+/// An exposure time for the status page: milliseconds with one decimal
+fn fmt_ms(us: u32) -> String { format!("{}.{}ms", us / 1000, (us % 1000) / 100) }
 
 pub struct WebcamUi {
     gfx: Gfx,
@@ -164,7 +185,7 @@ impl WebcamUi {
                 log::info!("webcam settings: {:?}", s);
                 let mode = match s.exp_mode {
                     2 => WebcamExposureMode::Manual {
-                        exposure: s.exposure,
+                        exposure_us: s.exposure_us,
                         pregain: s.pregain,
                         postgain: s.postgain,
                     },
@@ -264,10 +285,11 @@ impl WebcamUi {
         self.gfx.webcam_exposure_status().unwrap_or_default()
     }
 
-    fn set_manual(&mut self, exposure: u32, pregain: u8, postgain: u8) {
-        let exposure = exposure.clamp(1, 0x1fff) as u16;
-        self.gfx.webcam_exposure(WebcamExposureMode::Manual { exposure, pregain, postgain }).ok();
-        let text = format!("Exp {} gain {:02x}/{:02x}", exposure, pregain, postgain);
+    fn set_manual(&mut self, exposure_us: u32, pregain: u8, postgain: u8) {
+        // the sensor's limit is 8191 rows, about 560 ms at 768x576
+        let exposure_us = exposure_us.clamp(1, 600_000);
+        self.gfx.webcam_exposure(WebcamExposureMode::Manual { exposure_us, pregain, postgain }).ok();
+        let text = format!("Exp {} gain {:02x}/{:02x}", fmt_ms(exposure_us), pregain, postgain);
         self.notice(&text);
     }
 
@@ -286,8 +308,10 @@ impl WebcamUi {
             '↑' | '↓' => {
                 // about a quarter stop per press, from whatever is in force right now
                 let e = self.exposure_status();
-                let cur = e.exposure.max(1) as u32;
-                let new = if k == '↑' { cur * 5 / 4 + 1 } else { cur * 4 / 5 };
+                // (the 50 us makes every press move at least half of the longest row, about
+                // 70 us, so short exposures do not stick)
+                let cur = e.exposure_us.max(1);
+                let new = if k == '↑' { cur * 5 / 4 + 50 } else { (cur * 4 / 5).saturating_sub(50) };
                 self.set_manual(new, e.pregain, e.postgain);
             }
             '→' => self.set_view((self.view + 1) % 3),
@@ -324,14 +348,14 @@ impl WebcamUi {
             }
             MENU_EXPOSURE_MANUAL => {
                 let e = self.exposure_status();
-                self.set_manual(e.exposure as u32, e.pregain, e.postgain);
+                self.set_manual(e.exposure_us, e.pregain, e.postgain);
             }
             MENU_GAIN_UP | MENU_GAIN_DOWN => {
                 let e = self.exposure_status();
                 let cur = e.postgain.max(0x10) as u32;
                 let new =
                     if item == MENU_GAIN_UP { cur * 5 / 4 } else { cur * 4 / 5 }.clamp(0x10, 0xff) as u8;
-                self.set_manual(e.exposure as u32, e.pregain, new);
+                self.set_manual(e.exposure_us, e.pregain, new);
             }
             MENU_WB_AUTO => {
                 self.gfx.webcam_white_balance_auto().ok();
@@ -427,7 +451,8 @@ impl WebcamUi {
             writeln!(s, "Rotated 180").ok();
         }
         writeln!(s, "Sent {} drop {}", frames, cam.dropped).ok();
-        writeln!(s, "Exp {} {}", ["auto", "lock", "man"][(e.mode as usize).min(2)], e.exposure).ok();
+        writeln!(s, "Exp {} {}", ["auto", "lock", "man"][(e.mode as usize).min(2)], fmt_ms(e.exposure_us))
+            .ok();
         writeln!(s, "Gain {:02x}/{:02x}", e.pregain, e.postgain).ok();
         writeln!(
             s,

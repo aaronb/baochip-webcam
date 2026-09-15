@@ -16,7 +16,7 @@ impl<'a> ShellCmdApi<'a> for Webcam {
     fn process(&mut self, args: String, env: &mut CommonEnv) -> Result<Option<String>, xous::Error> {
         use core::fmt::Write;
         let mut ret = String::new();
-        let helpstring = "webcam [on [mode]|off|status|preview off|on|zoom|auto|lock|exposure <lines> [pregain] [postgain]|flicker 50|60|wb auto|cal|<r> <g> <b>|tp <pattern>|rotate on|off|usbreset]\nmodes: 0 768x576, 1 384x288, 2 160x120";
+        let helpstring = "webcam [on [mode]|off|status|preview off|on|zoom|auto|lock|exposure <ms> [pregain] [postgain]|flicker 50|60|wb auto|cal|<r> <g> <b>|tp <pattern>|rotate on|off|usbreset]\nmodes: 0 768x576, 1 384x288, 2 160x120";
         let mut tokens = args.split_whitespace();
         let gfx = ux_api::service::gfx::Gfx::new(&env.xns).unwrap();
         match tokens.next() {
@@ -52,9 +52,10 @@ impl<'a> ShellCmdApi<'a> for Webcam {
                 if let Ok(e) = gfx.webcam_exposure_status() {
                     write!(
                         ret,
-                        "\nexposure: {} lines={} pregain=0x{:02x} postgain=0x{:02x}\nwhite balance: {} gains=[{:02x} {:02x} {:02x}]\npreview: {}{}",
+                        "\nexposure: {} {}.{:02} ms pregain=0x{:02x} postgain=0x{:02x}\nwhite balance: {} gains=[{:02x} {:02x} {:02x}]\npreview: {}{}",
                         ["auto", "locked", "manual"][(e.mode as usize).min(2)],
-                        e.exposure,
+                        e.exposure_us / 1000,
+                        e.exposure_us % 1000 / 10,
                         e.pregain,
                         e.postgain,
                         ["sensor auto", "manual", "calibrating"][(e.wb_mode as usize).min(2)],
@@ -260,29 +261,35 @@ impl<'a> ShellCmdApi<'a> for Webcam {
                             .unwrap_or_else(|| t.parse::<u32>().ok()),
                     }
                 };
-                let exposure = parse(tokens.next(), 0);
+                // milliseconds, fractions allowed
+                let exposure_us =
+                    tokens.next().and_then(|t| t.parse::<f32>().ok()).map(|ms| (ms * 1000.0) as u32);
                 let pregain = parse(tokens.next(), 0x20);
                 let postgain = parse(tokens.next(), 0x40);
-                match (exposure, pregain, postgain) {
-                    (Some(exposure), Some(pregain), Some(postgain)) if exposure > 0 => {
+                match (exposure_us, pregain, postgain) {
+                    (Some(exposure_us), Some(pregain), Some(postgain)) if exposure_us > 0 => {
                         match gfx.webcam_exposure(ux_api::service::api::WebcamExposureMode::Manual {
-                            exposure: exposure as u16,
+                            exposure_us,
                             pregain: pregain as u8,
                             postgain: postgain as u8,
                         }) {
                             Ok(_) => write!(
                                 ret,
-                                "exposure: manual {} lines, gains 0x{:02x}/0x{:02x}",
-                                exposure, pregain, postgain
+                                "exposure: manual {}.{:02} ms, gains 0x{:02x}/0x{:02x}",
+                                exposure_us / 1000,
+                                exposure_us % 1000 / 10,
+                                pregain,
+                                postgain
                             )
                             .ok(),
                             Err(e) => write!(ret, "error: {:?}", e).ok(),
                         }
                     }
-                    _ => {
-                        write!(ret, "usage: webcam exposure <lines> [pregain] [postgain] (decimal or 0x hex)")
-                            .ok()
-                    }
+                    _ => write!(
+                        ret,
+                        "usage: webcam exposure <ms> [pregain] [postgain] (gains decimal or 0x hex; unity 0x20 and 0x40)"
+                    )
+                    .ok(),
                 }
             }
             _ => write!(ret, "{}", helpstring).ok(),

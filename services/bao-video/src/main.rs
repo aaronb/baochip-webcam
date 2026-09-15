@@ -332,8 +332,9 @@ impl WebcamState {
 #[cfg(feature = "uvc")]
 fn webcam_apply_settings(cam: &mut Gc2145, i2c: &mut I2c, webcam: &mut WebcamState) {
     webcam.exposure_applied = false;
-    if let WebcamExposureMode::Manual { exposure, pregain, postgain } = webcam.exposure_mode {
-        cam.set_exposure(i2c, exposure, pregain, postgain);
+    if let WebcamExposureMode::Manual { exposure_us, pregain, postgain } = webcam.exposure_mode {
+        // the stored time, in rows of the mode just configured
+        cam.set_exposure(i2c, cam.exposure_rows_for_us(exposure_us), pregain, postgain);
         webcam.exposure_applied = true;
     }
     if let WbMode::Manual(gains) = webcam.wb_mode {
@@ -1884,7 +1885,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                     webcam.exposure_mode = match a1 {
                         1 => WebcamExposureMode::Lock,
                         2 => WebcamExposureMode::Manual {
-                            exposure: (a2 as u16) & 0x1fff,
+                            exposure_us: a2 as u32,
                             pregain: a3 as u8,
                             postgain: a4 as u8,
                         },
@@ -1901,8 +1902,9 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                 webcam.exposure = cam.lock_exposure(&mut i2c);
                                 webcam.exposure_applied = true;
                             }
-                            WebcamExposureMode::Manual { exposure, pregain, postgain } => {
-                                cam.set_exposure(&mut i2c, exposure, pregain, postgain);
+                            WebcamExposureMode::Manual { exposure_us, pregain, postgain } => {
+                                let rows = cam.exposure_rows_for_us(exposure_us);
+                                cam.set_exposure(&mut i2c, rows, pregain, postgain);
                                 webcam.exposure = cam.read_exposure(&mut i2c);
                                 webcam.exposure_applied = true;
                             }
@@ -1920,12 +1922,13 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                     }
                     if let Some(scalar) = msg.body.scalar_message_mut() {
                         let mut e = webcam.exposure;
+                        let mut exposure_us = cam.exposure_us_for_rows(e.exposure);
                         if !webcam.active {
                             // report the settings that will apply, not the stale sensor read
-                            if let WebcamExposureMode::Manual { exposure, pregain, postgain } =
+                            if let WebcamExposureMode::Manual { exposure_us: us, pregain, postgain } =
                                 webcam.exposure_mode
                             {
-                                e.exposure = exposure;
+                                exposure_us = us;
                                 e.pregain = pregain;
                                 e.postgain = postgain;
                             }
@@ -1955,7 +1958,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                         } | (wb << 4)
                             | (view << 8)
                             | ((webcam.rotate as usize) << 12);
-                        scalar.arg2 = e.exposure as usize;
+                        scalar.arg2 = exposure_us as usize;
                         scalar.arg3 = (e.pregain as usize) << 8 | e.postgain as usize;
                         scalar.arg4 =
                             (e.awb[0] as usize) << 16 | (e.awb[1] as usize) << 8 | e.awb[2] as usize;

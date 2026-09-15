@@ -136,7 +136,8 @@ pub enum GfxOpcode {
     WebcamWatchdog,
     /// Exposure, white balance and preview control (blocking scalar). arg1 selects:
     /// 0 = auto exposure, 1 = lock exposure at the current values, 2 = manual exposure with
-    /// arg2 = exposure lines, arg3 = pre-gain, arg4 = post-gain (4.4 fixed point);
+    /// arg2 = exposure time in microseconds, arg3 = pre-gain (unity 0x20), arg4 = post-gain
+    /// (unity 0x40);
     /// 3 = manual white balance, arg2..arg4 = R, G, B gains; 7 = white balance mode, arg2 = 0
     /// for the sensor's own engine, 2 for a one-shot grey-world calibration that ends in manual
     /// gains; 6 = preview, arg2 = 0 off, 1 full frame, 2 centre crop; 8 = rotate the picture a
@@ -148,8 +149,9 @@ pub enum GfxOpcode {
     WebcamExposure,
     /// Blocking scalar; returns arg1 = exposure mode (0 auto, 1 locked, 2 manual) | white
     /// balance mode << 4 (0 sensor auto, 1 manual, 2 calibrating) | preview view << 8 |
-    /// rotated << 12, arg2 = exposure lines, arg3 = pre-gain << 8 | post-gain, arg4 = AWB R << 16 | G << 8 |
-    /// B. Live values while the camera is on, otherwise the last seen.
+    /// rotated << 12, arg2 = exposure time in microseconds, arg3 = pre-gain << 8 | post-gain,
+    /// arg4 = AWB R << 16 | G << 8 | B. Live values while the camera is on, otherwise the last
+    /// seen.
     #[cfg(feature = "board-baosec")]
     WebcamExposureStatus,
 
@@ -218,9 +220,12 @@ pub enum WebcamExposureMode {
     Auto,
     /// freeze whatever the automatic engines have converged on
     Lock,
-    /// explicit exposure (line units) and pre/post gains (4.4 fixed point, 0x40 = 1.0)
+    /// explicit exposure time in microseconds, and the sensor's pre and post gains. The video
+    /// server converts the time to sensor rows for the running mode (a row's duration depends
+    /// on the readout window). The gain format is undocumented: unity is 0x20 for the pre-gain
+    /// and 0x40 for the post-gain, the datasheet's defaults.
     Manual {
-        exposure: u16,
+        exposure_us: u32,
         pregain: u8,
         postgain: u8,
     },
@@ -238,7 +243,8 @@ pub struct WebcamExposureStatus {
     pub preview: u8,
     /// the picture is rotated a half turn (badge hung upside down)
     pub rotate: bool,
-    pub exposure: u16,
+    /// exposure time in microseconds (sensor rows converted with the running mode's row time)
+    pub exposure_us: u32,
     pub pregain: u8,
     pub postgain: u8,
     pub awb: [u8; 3],

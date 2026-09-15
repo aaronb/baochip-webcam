@@ -34,11 +34,13 @@ pub const DEFAULT_MAINS_HZ: u32 = 60;
 /// Exposure and white-balance state of the GC2145 (page 0 registers 0x03/0x04, 0xb1..0xb6, 0x82).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Gc2145Exposure {
-    /// coarse exposure in line units (13 bits)
+    /// exposure in rows (13 bits); a row's duration depends on the readout window, see
+    /// `Gc2145::exposure_us_for_rows`
     pub exposure: u16,
-    /// analog pre-gain, 4.4 fixed point (0x40 = 1.0)
+    /// digital pre-gain (P0:0xb1). The datasheet gives no format; unity is 0x20, its default
+    /// (the AEC's own pre-gain ceiling, P1:0x1f, is 0x35 in `GC2145_AEC`)
     pub pregain: u8,
-    /// digital post-gain, 4.4 fixed point
+    /// digital post-gain (P0:0xb2); unity is 0x40, its default
     pub postgain: u8,
     /// white-balance gains R, G, B, 4.4 fixed point
     pub awb: [u8; 3],
@@ -145,8 +147,8 @@ impl Gc2145 {
         Gc2145Exposure { aec_on: false, ..cur }
     }
 
-    /// Manual exposure: AEC off, `exposure` in line units (13 bits), gains in the sensor's 4.4
-    /// fixed-point format (0x40 = 1.0). White balance is not touched.
+    /// Manual exposure: AEC off, `exposure` in rows (13 bits; see `exposure_rows_for_us`), gains
+    /// as in `Gc2145Exposure` (unity 0x20 pre, 0x40 post). White balance is not touched.
     pub fn set_exposure(&self, i2c: &mut dyn I2cApi, exposure: u16, pregain: u8, postgain: u8) {
         self.set_aec_enable(i2c, false);
         self.poke(i2c, 0x03, ((exposure >> 8) & 0x1f) as u8);
@@ -189,6 +191,15 @@ impl Gc2145 {
     /// Frame time of the configured readout window while the exposure fits inside the frame
     /// (a longer exposure stretches the frame), in microseconds.
     pub fn frame_us(&self) -> u32 { (self.frame_rows as u64 * self.row_ns() / 1000) as u32 }
+
+    /// Exposure rows (13 bits, at least one) for an exposure time, for the configured window.
+    pub fn exposure_rows_for_us(&self, us: u32) -> u16 {
+        let ns = self.row_ns();
+        ((us as u64 * 1000 + ns / 2) / ns).clamp(1, 0x1fff) as u16
+    }
+
+    /// Exposure time in microseconds of `rows` exposure rows, for the configured window.
+    pub fn exposure_us_for_rows(&self, rows: u16) -> u32 { (rows as u64 * self.row_ns() / 1000) as u32 }
 
     /// Set the mains frequency (50 or 60 Hz; anything else is taken as 60) the AEC's anti-flicker
     /// step is derived from. Takes effect at the next `init_window`, or at once through
