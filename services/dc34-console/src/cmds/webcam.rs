@@ -1,0 +1,158 @@
+use String;
+
+use crate::{CommonEnv, ShellCmdApi};
+
+/// Control the USB webcam: `webcam on|off|status`.
+///
+/// Normally the camera starts by itself when a host opens the video device (the USB service tells
+/// the video server when the stream is committed). `on` forces capture regardless, which is
+/// useful when bringing the feature up; `status` shows both sides of the pipeline.
+#[derive(Debug)]
+pub struct Webcam {}
+
+impl<'a> ShellCmdApi<'a> for Webcam {
+    cmd_api!(webcam);
+
+    fn process(&mut self, args: String, env: &mut CommonEnv) -> Result<Option<String>, xous::Error> {
+        use core::fmt::Write;
+        let mut ret = String::new();
+        let helpstring = "webcam [on [mode]|off|status|preview [off]|auto|lock|exposure <lines> [pregain] [postgain]]\nmodes: 0 160x120, 1 384x288, 2 768x576";
+        let mut tokens = args.split_whitespace();
+        let gfx = ux_api::service::gfx::Gfx::new(&env.xns).unwrap();
+        match tokens.next() {
+            Some("on") => {
+                let mode = tokens.next().and_then(|t| t.parse::<usize>().ok()).unwrap_or(0);
+                match gfx.webcam_control_mode(true, mode) {
+                    Ok(true) => write!(ret, "webcam capturing (mode {})", mode).ok(),
+                    Ok(false) => write!(ret, "webcam did not start (QR scan in progress?)").ok(),
+                    Err(e) => write!(ret, "error: {:?}", e).ok(),
+                }
+            }
+            Some("off") => match gfx.webcam_control(false) {
+                Ok(_) => write!(ret, "webcam stopped").ok(),
+                Err(e) => write!(ret, "error: {:?}", e).ok(),
+            },
+            Some("status") => {
+                let usb = usb_bao1x::UsbHid::new();
+                let (streaming, frames_sent) = usb.uvc_status().unwrap_or((false, 0));
+                match gfx.webcam_status() {
+                    Ok(s) => write!(
+                        ret,
+                        "camera: {} ({} captured, {} sent, {} dropped)\nusb: host {} ({} frames transmitted)",
+                        if s.active { "capturing" } else { "off" },
+                        s.captured,
+                        s.sent,
+                        s.dropped,
+                        if streaming { "streaming" } else { "idle" },
+                        frames_sent
+                    )
+                    .ok(),
+                    Err(e) => write!(ret, "error: {:?}", e).ok(),
+                };
+                if let Ok(e) = gfx.webcam_exposure_status() {
+                    write!(
+                        ret,
+                        "\nexposure: {} lines={} pregain=0x{:02x} postgain=0x{:02x} awb=[{:02x} {:02x} {:02x}]",
+                        ["auto", "locked", "manual"][(e.mode as usize).min(2)],
+                        e.exposure,
+                        e.pregain,
+                        e.postgain,
+                        e.awb[0],
+                        e.awb[1],
+                        e.awb[2]
+                    )
+                    .ok();
+                }
+                None
+            }
+            Some("auto") => match gfx.webcam_exposure(ux_api::service::api::WebcamExposureMode::Auto) {
+                Ok(_) => write!(ret, "exposure: auto").ok(),
+                Err(e) => write!(ret, "error: {:?}", e).ok(),
+            },
+            Some("lock") => match gfx.webcam_exposure(ux_api::service::api::WebcamExposureMode::Lock) {
+                Ok(_) => write!(ret, "exposure: locked (applied once auto has settled if the camera is starting)").ok(),
+                Err(e) => write!(ret, "error: {:?}", e).ok(),
+            },
+            Some("preview") => {
+                let on = !matches!(tokens.next(), Some("off"));
+                match gfx.webcam_preview(on) {
+                    Ok(_) => write!(ret, "preview {}", if on { "on" } else { "off" }).ok(),
+                    Err(e) => write!(ret, "error: {:?}", e).ok(),
+                }
+            }
+            Some("raw") => {
+                let parse = |s: Option<&str>| -> Option<usize> { s.and_then(|t| t.parse::<usize>().ok()) };
+                match (parse(tokens.next()), parse(tokens.next()), parse(tokens.next()), parse(tokens.next())) {
+                    (Some(w), Some(h), Some(ratio), pad) => match gfx.webcam_raw(w, h, ratio, pad.unwrap_or(24)) {
+                        Ok(_) => write!(ret, "raw capture {}x{} ratio {} pad {}", w, h, ratio, pad.unwrap_or(24)).ok(),
+                        Err(e) => write!(ret, "error: {:?}", e).ok(),
+                    },
+                    _ => write!(ret, "usage: webcam raw <w> <h> <ratio> [pad]").ok(),
+                }
+            }
+            Some("clkdiv") => {
+                let v = tokens.next().and_then(|t| t.strip_prefix("0x").map(|h| usize::from_str_radix(h, 16).ok()).unwrap_or_else(|| t.parse::<usize>().ok()));
+                match v {
+                    Some(v) => match gfx.webcam_tune(4, v, 0, 0) {
+                        Ok(_) => write!(ret, "ratio-1 clock divider 0x{:02x}", v).ok(),
+                        Err(e) => write!(ret, "error: {:?}", e).ok(),
+                    },
+                    None => write!(ret, "usage: webcam clkdiv <0xNN>").ok(),
+                }
+            }
+            Some("poke") => {
+                let parse = |s: Option<&str>| -> Option<usize> {
+                    s.and_then(|t| t.strip_prefix("0x").map(|h| usize::from_str_radix(h, 16).ok()).unwrap_or_else(|| t.parse::<usize>().ok()))
+                };
+                match (parse(tokens.next()), parse(tokens.next()), parse(tokens.next())) {
+                    (Some(page), Some(reg), Some(val)) => match gfx.webcam_tune(5, page, reg, val) {
+                        Ok(_) => write!(ret, "poked p{} 0x{:02x} <- 0x{:02x} (see log for readback)", page, reg, val).ok(),
+                        Err(_) => write!(ret, "poke failed (camera off?)").ok(),
+                    },
+                    _ => write!(ret, "usage: webcam poke <page> <reg> <val>").ok(),
+                }
+            }
+            Some("wb") => {
+                let parse = |s: Option<&str>| -> Option<u8> {
+                    s.and_then(|t| t.strip_prefix("0x").map(|h| u8::from_str_radix(h, 16).ok()).unwrap_or_else(|| t.parse::<u8>().ok()))
+                };
+                match (parse(tokens.next()), parse(tokens.next()), parse(tokens.next())) {
+                    (Some(r), Some(g), Some(b)) => match gfx.webcam_white_balance([r, g, b]) {
+                        Ok(_) => write!(ret, "white balance: manual gains 0x{:02x}/0x{:02x}/0x{:02x}", r, g, b).ok(),
+                        Err(e) => write!(ret, "error: {:?}", e).ok(),
+                    },
+                    _ => write!(ret, "usage: webcam wb <r> <g> <b> (4.4 fixed point, 0x40 = 1.0)").ok(),
+                }
+            }
+            Some("exposure") => {
+                let parse = |s: Option<&str>, default: u32| -> Option<u32> {
+                    match s {
+                        None => Some(default),
+                        Some(t) => t
+                            .strip_prefix("0x")
+                            .map(|h| u32::from_str_radix(h, 16).ok())
+                            .unwrap_or_else(|| t.parse::<u32>().ok()),
+                    }
+                };
+                let exposure = parse(tokens.next(), 0);
+                let pregain = parse(tokens.next(), 0x20);
+                let postgain = parse(tokens.next(), 0x40);
+                match (exposure, pregain, postgain) {
+                    (Some(exposure), Some(pregain), Some(postgain)) if exposure > 0 => {
+                        match gfx.webcam_exposure(ux_api::service::api::WebcamExposureMode::Manual {
+                            exposure: exposure as u16,
+                            pregain: pregain as u8,
+                            postgain: postgain as u8,
+                        }) {
+                            Ok(_) => write!(ret, "exposure: manual {} lines, gains 0x{:02x}/0x{:02x}", exposure, pregain, postgain).ok(),
+                            Err(e) => write!(ret, "error: {:?}", e).ok(),
+                        }
+                    }
+                    _ => write!(ret, "usage: webcam exposure <lines> [pregain] [postgain] (decimal or 0x hex)").ok(),
+                }
+            }
+            _ => write!(ret, "{}", helpstring).ok(),
+        };
+        Ok(Some(ret))
+    }
+}

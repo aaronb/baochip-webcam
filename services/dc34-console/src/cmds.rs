@@ -82,6 +82,10 @@ mod image;
 use image::*;
 mod bio;
 use bio::*;
+#[cfg(feature = "board-baosec")]
+mod webcam;
+#[cfg(feature = "board-baosec")]
+use webcam::*;
 
 pub struct CmdEnv {
     common_env: CommonEnv,
@@ -121,11 +125,15 @@ impl CmdEnv {
 
         let mut echo_cmd = Echo {}; // this command has no persistent storage, so we can "create" it every time we call dispatch (but it's a zero-cost absraction so this doesn't actually create any instructions)
         let mut ver_cmd = Ver {};
+        #[cfg(feature = "board-baosec")]
+        let mut webcam_cmd = Webcam {};
 
         let commands: &mut [&mut dyn ShellCmdApi] = &mut [
             ///// 4. add your command to this array, so that it can be looked up and dispatched
             &mut echo_cmd,
             &mut ver_cmd,
+            #[cfg(feature = "board-baosec")]
+            &mut webcam_cmd,
             &mut self.test,
             &mut self.image,
             &mut self.bio,
