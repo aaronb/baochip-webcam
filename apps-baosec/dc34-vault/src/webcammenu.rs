@@ -8,7 +8,7 @@ use crate::webcam_ui::*;
 
 pub fn create_submenu(vault_conn: xous::CID, actions_conn: xous::CID, menu_mgr: xous::SID) -> MenuMatic {
     let mut menu_items = Vec::<MenuItem>::new();
-    let entries: [(&str, usize); 12] = [
+    let entries: [(&str, usize); 14] = [
         ("Exposure: auto", MENU_EXPOSURE_AUTO),
         ("Exposure: lock", MENU_EXPOSURE_LOCK),
         ("Exposure: manual", MENU_EXPOSURE_MANUAL),
@@ -19,6 +19,8 @@ pub fn create_submenu(vault_conn: xous::CID, actions_conn: xous::CID, menu_mgr: 
         ("View: preview", MENU_VIEW_FULL),
         ("View: zoom", MENU_VIEW_ZOOM),
         ("View: status", MENU_VIEW_STATUS),
+        ("Rotate 180", MENU_ROTATE),
+        ("Camera on/off", MENU_CAMERA),
         ("Save as default", MENU_SAVE),
         ("Reset USB", MENU_USB_RESET),
     ];

@@ -3,8 +3,11 @@
 //!
 //! Buttons: the centre button toggles the exposure lock, up and down nudge the exposure
 //! (switching to manual), left and right cycle the OLED view (status page, full-frame preview,
-//! 1:1 centre crop), select opens the menu. The menu can save the current settings as the
-//! boot default, which is applied before the host ever opens the camera.
+//! 1:1 centre crop), select opens the menu. Entering a preview view starts the camera if no
+//! host has it open, and leaving for the status page stops it again unless a host is
+//! streaming; the menu can also keep the camera on. The menu can rotate the picture a half
+//! turn for a badge hung upside down, and save the current settings as the boot default,
+//! which is applied before the host ever opens the camera.
 
 use core::fmt::Write as _;
 use std::io::{Read, Write};
@@ -17,8 +20,10 @@ use ux_api::service::gfx::Gfx;
 
 /// PDDB key (in `DC34_DICT`) holding the saved webcam settings
 const DC34_WEBCAM: &str = "webcam";
-const SETTINGS_VERSION: u8 = 1;
-const SETTINGS_LEN: usize = 11;
+const SETTINGS_VERSION: u8 = 2;
+const SETTINGS_LEN: usize = 12;
+/// version 1 had no rotation byte
+const SETTINGS_LEN_V1: usize = 11;
 
 /// Menu actions, carried as the scalar payload of `VaultOp::WebcamMenu`
 pub const MENU_EXPOSURE_AUTO: usize = 0;
@@ -33,6 +38,8 @@ pub const MENU_VIEW_ZOOM: usize = 8;
 pub const MENU_VIEW_STATUS: usize = 9;
 pub const MENU_SAVE: usize = 10;
 pub const MENU_USB_RESET: usize = 11;
+pub const MENU_ROTATE: usize = 12;
+pub const MENU_CAMERA: usize = 13;
 
 /// OLED views: the vault's status page (preview off), the full-frame preview, the centre crop
 const VIEW_STATUS: u8 = 0;
@@ -57,6 +64,8 @@ struct Settings {
     wb_mode: u8,
     wb: [u8; 3],
     view: u8,
+    /// picture rotated a half turn
+    rotate: bool,
 }
 
 impl Settings {
@@ -69,6 +78,7 @@ impl Settings {
             wb_mode: if e.wb_mode == 0 { 0 } else { 1 },
             wb: e.awb,
             view,
+            rotate: e.rotate,
         }
     }
 
@@ -85,11 +95,13 @@ impl Settings {
             self.wb[1],
             self.wb[2],
             self.view,
+            self.rotate as u8,
         ]
     }
 
     fn from_bytes(b: &[u8]) -> Option<Settings> {
-        if b.len() != SETTINGS_LEN || b[0] != SETTINGS_VERSION {
+        let v1 = b.len() == SETTINGS_LEN_V1 && b[0] == 1;
+        if !v1 && (b.len() != SETTINGS_LEN || b[0] != SETTINGS_VERSION) {
             return None;
         }
         Some(Settings {
@@ -100,12 +112,15 @@ impl Settings {
             wb_mode: b[6],
             wb: [b[7], b[8], b[9]],
             view: b[10].min(VIEW_ZOOM),
+            rotate: !v1 && b[11] != 0,
         })
     }
 }
 
 pub struct WebcamUi {
     gfx: Gfx,
+    /// the buttons swap sides with the picture rotated
+    kbd: bao1x_api::keyboard::Keyboard,
     usb: usb_bao1x::UsbHid,
     tt: ticktimer_server::Ticktimer,
     view: u8,
@@ -116,12 +131,15 @@ pub struct WebcamUi {
     last_draw_ms: u64,
     /// feedback line for the last button or menu action, with the time it was set
     notice: Option<(String, u64)>,
+    /// the camera was started from here (preview or menu) rather than by a host
+    local_camera: bool,
 }
 
 impl WebcamUi {
     pub fn new(xns: &xous_names::XousNames) -> Self {
         WebcamUi {
             gfx: Gfx::new(xns).unwrap(),
+            kbd: bao1x_api::keyboard::Keyboard::new(xns).unwrap(),
             usb: usb_bao1x::UsbHid::new(),
             tt: ticktimer_server::Ticktimer::new().unwrap(),
             view: VIEW_FULL,
@@ -129,6 +147,7 @@ impl WebcamUi {
             last_page: String::new(),
             last_draw_ms: 0,
             notice: None,
+            local_camera: false,
         }
     }
 
@@ -157,13 +176,37 @@ impl WebcamUi {
                 } else {
                     self.gfx.webcam_white_balance_auto().ok();
                 }
+                self.set_rotate(s.rotate);
                 self.set_view(s.view);
             }
             None => {
                 log::info!("webcam settings: none saved, using defaults");
+                self.set_rotate(false);
                 self.set_view(VIEW_FULL);
             }
         }
+    }
+
+    /// Rotate the picture a half turn (badge hung upside down): the sensor readout, the panel
+    /// orientation for the UI's own screens, and the button directions. Setting it once also
+    /// stops the accelerometer from flipping the screen on its own.
+    fn set_rotate(&mut self, on: bool) {
+        self.gfx.webcam_rotate(on).ok();
+        self.kbd.flip_orientation(on);
+    }
+
+    /// Start the camera for local use (the video server keeps it on through host stream stops).
+    fn camera_on(&mut self) {
+        match self.gfx.webcam_control_mode(true, 0) {
+            Ok(true) => self.local_camera = true,
+            _ => self.notice("Camera: start failed"),
+        }
+    }
+
+    /// End local use of the camera; the video server keeps it on if a host is streaming.
+    fn camera_off(&mut self) {
+        self.local_camera = false;
+        self.gfx.webcam_control(false).ok();
     }
 
     fn save_settings(&mut self) {
@@ -195,6 +238,14 @@ impl WebcamUi {
 
     fn set_view(&mut self, view: u8) {
         self.view = view.min(VIEW_ZOOM);
+        // a preview needs the camera running; the status page gives a locally started one up
+        if self.view != VIEW_STATUS {
+            if !self.gfx.webcam_status().map(|s| s.active).unwrap_or(false) {
+                self.camera_on();
+            }
+        } else if self.local_camera {
+            self.camera_off();
+        }
         self.gfx.webcam_preview_view(self.view).ok();
         self.force_redraw();
     }
@@ -293,6 +344,23 @@ impl WebcamUi {
             MENU_VIEW_FULL => self.set_view(VIEW_FULL),
             MENU_VIEW_ZOOM => self.set_view(VIEW_ZOOM),
             MENU_VIEW_STATUS => self.set_view(VIEW_STATUS),
+            MENU_ROTATE => {
+                let on = !self.exposure_status().rotate;
+                self.set_rotate(on);
+                self.notice(if on { "Rotated 180" } else { "Upright" });
+            }
+            MENU_CAMERA => {
+                let (streaming, _) = self.usb.uvc_status().unwrap_or((false, 0));
+                if self.local_camera {
+                    self.camera_off();
+                    self.notice(if streaming { "Camera: host only" } else { "Camera: off" });
+                } else {
+                    self.camera_on();
+                    if self.local_camera {
+                        self.notice("Camera: kept on");
+                    }
+                }
+            }
             MENU_SAVE => self.save_settings(),
             MENU_USB_RESET => {
                 let usb = usb_bao1x::UsbHid::new();
@@ -354,8 +422,11 @@ impl WebcamUi {
             if streaming { "live" } else { "idle" }
         )
         .ok();
-        writeln!(s, "Sent {} drop {}", frames, cam.dropped).ok();
         let e = self.exposure_status();
+        if e.rotate {
+            writeln!(s, "Rotated 180").ok();
+        }
+        writeln!(s, "Sent {} drop {}", frames, cam.dropped).ok();
         writeln!(s, "Exp {} {}", ["auto", "lock", "man"][(e.mode as usize).min(2)], e.exposure).ok();
         writeln!(s, "Gain {:02x}/{:02x}", e.pregain, e.postgain).ok();
         writeln!(

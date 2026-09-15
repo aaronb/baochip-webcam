@@ -259,6 +259,13 @@ struct WebcamState {
     wb_acc: [u64; 4],
     /// preview shows a 1:1 centre crop instead of the whole frame
     preview_zoom: bool,
+    /// picture rotated a half turn (sensor readout direction); persists across sessions
+    rotate: bool,
+    /// the USB host has a stream open (the observer's start/stop events)
+    host_streaming: bool,
+    /// the UI has set the orientation explicitly (`rotate`): the accelerometer-driven
+    /// `FlipScreen` requests are ignored from then on
+    orientation_manual: bool,
 }
 
 /// White balance handling for the webcam.
@@ -314,6 +321,9 @@ impl WebcamState {
             wb_calibrating: 0,
             wb_acc: [0; 4],
             preview_zoom: false,
+            rotate: false,
+            host_streaming: false,
+            orientation_manual: false,
         }
     }
 }
@@ -400,18 +410,7 @@ fn webcam_start_capture(
     // and the frame copy drops the 3 stale words at the start of every line.
     cam.init_window(i2c, mode.line_px() as u16, (mode.height + 1) as u16, mode.ratio);
     tt.sleep_ms(15).ok();
-    // The init table enables the sensor's horizontal mirror only (P0 reg 0x17 bit 0, reads
-    // 0x15), which is right for the badge's own display but mirrors the webcam picture. With
-    // the mirror off the picture is un-mirrored but upside down for a badge held with its
-    // text upright (a page under the camera comes out rotated a half turn on the host and on
-    // the OLED preview alike). Mirror plus vertical flip (bits 1:0 = 0b11) rotates the readout
-    // a half turn, which is un-mirrored and upright.
-    {
-        cam.poke(i2c, 0xfe, 0x00);
-        let mut v = [0u8; 1];
-        cam.peek(i2c, 0x17, &mut v);
-        cam.poke(i2c, 0x17, v[0] | 0x03);
-    }
+    webcam_apply_rotation(cam, i2c, webcam.rotate);
     if mode.ratio == 1 {
         cam.poke(i2c, 0xfe, 0x00);
         cam.poke(i2c, 0xfa, clkdiv_ratio1);
@@ -428,6 +427,29 @@ fn webcam_start_capture(
         );
     }
     webcam_ring_start_frame(cam, &ring, webcam);
+}
+
+/// Readout direction, P0 reg 0x17 bits 1:0. The init table enables the sensor's horizontal
+/// mirror only (reads 0x15), which is right for the badge's own display but mirrors the webcam
+/// picture. Mirror plus vertical flip (0b11) is un-mirrored and upright for a badge held with
+/// its text upright; neither (0b00) is the same picture rotated a half turn, for a badge hung
+/// upside down. The sensor's ISP keeps the colour filter phase right through both (measured:
+/// all four settings give the same colours).
+#[cfg(feature = "uvc")]
+fn webcam_apply_rotation(cam: &mut Gc2145, i2c: &mut I2c, rotate: bool) {
+    cam.poke(i2c, 0xfe, 0x00);
+    let mut v = [0u8; 1];
+    cam.peek(i2c, 0x17, &mut v);
+    cam.poke(i2c, 0x17, (v[0] & !0x03) | if rotate { 0x00 } else { 0x03 });
+}
+
+/// Panel orientation for the webcam appliance. With the readout rotated, the preview is drawn
+/// from the rotated frames and so is already upright on the physically inverted panel; only
+/// the UI's own screens (status page, menu) need the panel flipped.
+#[cfg(feature = "uvc")]
+fn webcam_panel_orientation(display: &mut Oled128x128, udma_global: &UdmaGlobal, webcam: &WebcamState) {
+    let flip = webcam.rotate && !(webcam.active && webcam.preview);
+    display.flip_vertical(flip).unwrap_or_else(|_| display_timeout_handler(udma_global, display));
 }
 
 /// How a mode's frame maps onto the camera IFRAM: a ring of `depth` slots of `slot_bytes`, and
@@ -1560,6 +1582,9 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                         .map(|s| (s.arg1 != 0, s.arg2, s.arg3, s.arg4))
                         .unwrap_or((false, 0, 0, 0));
                     let from_console = source != 0;
+                    if !from_console {
+                        webcam.host_streaming = on;
+                    }
                     let raw = if source == 2 {
                         // console bring-up geometry: arg3 = w << 16 | h, arg4 = ratio << 8 | pad
                         let (w, h) = (arg3 >> 16, arg3 & 0xffff);
@@ -1623,21 +1648,35 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                             );
                             webcam_apply_settings(&mut cam, &mut i2c, &mut webcam);
                             webcam_arm_watchdog(cid, webcam.captured, &tt);
+                            webcam_panel_orientation(&mut display, &udma_global, &webcam);
                             log::info!("webcam started");
                         }
-                    } else if webcam.active && webcam.pinned && !from_console {
-                        log::debug!("webcam: host stream stopped; camera stays on (pinned by console)");
-                    } else if webcam.active {
-                        webcam.pinned = false;
-                        webcam.custom = None;
-                        webcam.active = false;
-                        camera_power_down(&iox, &mut timer, cam_clk, cam_pdwn, &tt);
-                        log::info!(
-                            "webcam stopped: {} captured, {} sent, {} dropped",
-                            webcam.captured,
-                            webcam.sent,
-                            webcam.dropped
-                        );
+                    } else {
+                        // The camera runs while either side wants it: a host stream stop leaves
+                        // a locally started camera on, and a local stop leaves a host stream on.
+                        if from_console {
+                            webcam.pinned = false;
+                        }
+                        let wanted =
+                            (webcam.pinned && !from_console) || (webcam.host_streaming && from_console);
+                        if webcam.active && wanted {
+                            log::debug!(
+                                "webcam: {} stopped; camera stays on",
+                                if from_console { "local use" } else { "host stream" }
+                            );
+                        } else if webcam.active {
+                            webcam.pinned = false;
+                            webcam.custom = None;
+                            webcam.active = false;
+                            camera_power_down(&iox, &mut timer, cam_clk, cam_pdwn, &tt);
+                            webcam_panel_orientation(&mut display, &udma_global, &webcam);
+                            log::info!(
+                                "webcam stopped: {} captured, {} sent, {} dropped",
+                                webcam.captured,
+                                webcam.sent,
+                                webcam.dropped
+                            );
+                        }
                     }
                     if let Some(scalar) = msg.body.scalar_message_mut() {
                         scalar.arg1 = if webcam.active { 1 } else { 0 };
@@ -1686,11 +1725,39 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                         Some(sc) => (sc.arg1, sc.arg2, sc.arg3, sc.arg4),
                         None => (0, 0, 0, 0),
                     };
+                    if a1 == 8 {
+                        webcam.rotate = a2 != 0;
+                        webcam.orientation_manual = true;
+                        orientation = if webcam.rotate {
+                            DisplayOrientation::UpsideDown
+                        } else {
+                            DisplayOrientation::Normal
+                        };
+                        if webcam.active {
+                            webcam_apply_rotation(&mut cam, &mut i2c, webcam.rotate);
+                        }
+                        webcam_panel_orientation(&mut display, &udma_global, &webcam);
+                        if !(webcam.active && webcam.preview) {
+                            if webcam.active {
+                                webcam.flush_pending = true;
+                            } else {
+                                display
+                                    .redraw()
+                                    .unwrap_or_else(|_| display_timeout_handler(&udma_global, &mut display));
+                            }
+                        }
+                        log::info!("webcam: rotated {}", webcam.rotate);
+                        if let Some(scalar) = msg.body.scalar_message_mut() {
+                            scalar.arg1 = 1;
+                        }
+                        continue;
+                    }
                     if a1 == 6 {
                         webcam.preview = a2 != 0;
                         webcam.preview_zoom = a2 == 2;
                         webcam.preview_col = 0;
                         webcam.preview_fb.fill(!0);
+                        webcam_panel_orientation(&mut display, &udma_global, &webcam);
                         if !webcam.preview {
                             // the UI's buffer is intact (the preview never painted it): show it
                             if webcam.active {
@@ -1859,7 +1926,8 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                             WebcamExposureMode::Lock => 1,
                             WebcamExposureMode::Manual { .. } => 2,
                         } | (wb << 4)
-                            | (view << 8);
+                            | (view << 8)
+                            | ((webcam.rotate as usize) << 12);
                         scalar.arg2 = e.exposure as usize;
                         scalar.arg3 = (e.pregain as usize) << 8 | e.postgain as usize;
                         scalar.arg4 =
@@ -2097,6 +2165,12 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                 }
                 #[cfg(feature = "board-baosec")]
                 GfxOpcode::FlipScreen => {
+                    #[cfg(feature = "uvc")]
+                    if webcam.orientation_manual {
+                        // the webcam UI's rotation setting owns the panel orientation
+                        log::debug!("gfx flip ignored: orientation is set manually");
+                        continue;
+                    }
                     if let Some(scalar) = msg.body.scalar_message_mut() {
                         log::debug!("gfx flip");
                         if scalar.arg1 != 0 {

@@ -139,14 +139,16 @@ pub enum GfxOpcode {
     /// arg2 = exposure lines, arg3 = pre-gain, arg4 = post-gain (4.4 fixed point);
     /// 3 = manual white balance, arg2..arg4 = R, G, B gains; 7 = white balance mode, arg2 = 0
     /// for the sensor's own engine, 2 for a one-shot grey-world calibration that ends in manual
-    /// gains; 6 = preview, arg2 = 0 off, 1 full frame, 2 centre crop; 4 and 5 are tuning knobs.
+    /// gains; 6 = preview, arg2 = 0 off, 1 full frame, 2 centre crop; 8 = rotate the picture a
+    /// half turn, arg2 = 0 upright, 1 rotated (the sensor's readout direction, so the preview
+    /// and the USB stream both turn); 4 and 5 are tuning knobs.
     /// Settings persist across capture sessions. Reply arg1 = 1 on success.
     #[cfg(feature = "board-baosec")]
     WebcamExposure,
     /// Blocking scalar; returns arg1 = exposure mode (0 auto, 1 locked, 2 manual) | white
-    /// balance mode << 4 (0 sensor auto, 1 manual, 2 calibrating) | preview view << 8,
-    /// arg2 = exposure lines, arg3 = pre-gain << 8 | post-gain, arg4 = AWB R << 16 | G << 8 | B.
-    /// Live values while the camera is on, otherwise the last seen.
+    /// balance mode << 4 (0 sensor auto, 1 manual, 2 calibrating) | preview view << 8 |
+    /// rotated << 12, arg2 = exposure lines, arg3 = pre-gain << 8 | post-gain, arg4 = AWB R << 16 | G << 8 |
+    /// B. Live values while the camera is on, otherwise the last seen.
     #[cfg(feature = "board-baosec")]
     WebcamExposureStatus,
 
@@ -233,6 +235,8 @@ pub struct WebcamExposureStatus {
     pub wb_mode: u8,
     /// OLED preview: 0 off (the UI's own screen shows), 1 full frame, 2 centre crop
     pub preview: u8,
+    /// the picture is rotated a half turn (badge hung upside down)
+    pub rotate: bool,
     pub exposure: u16,
     pub pregain: u8,
     pub postgain: u8,

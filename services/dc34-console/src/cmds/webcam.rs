@@ -16,7 +16,7 @@ impl<'a> ShellCmdApi<'a> for Webcam {
     fn process(&mut self, args: String, env: &mut CommonEnv) -> Result<Option<String>, xous::Error> {
         use core::fmt::Write;
         let mut ret = String::new();
-        let helpstring = "webcam [on [mode]|off|status|preview off|on|zoom|auto|lock|exposure <lines> [pregain] [postgain]|wb auto|cal|<r> <g> <b>|tp <pattern>|usbreset]\nmodes: 0 160x120, 1 384x288, 2 768x576";
+        let helpstring = "webcam [on [mode]|off|status|preview off|on|zoom|auto|lock|exposure <lines> [pregain] [postgain]|wb auto|cal|<r> <g> <b>|tp <pattern>|rotate on|off|usbreset]\nmodes: 0 768x576, 1 384x288, 2 160x120";
         let mut tokens = args.split_whitespace();
         let gfx = ux_api::service::gfx::Gfx::new(&env.xns).unwrap();
         match tokens.next() {
@@ -52,7 +52,7 @@ impl<'a> ShellCmdApi<'a> for Webcam {
                 if let Ok(e) = gfx.webcam_exposure_status() {
                     write!(
                         ret,
-                        "\nexposure: {} lines={} pregain=0x{:02x} postgain=0x{:02x}\nwhite balance: {} gains=[{:02x} {:02x} {:02x}]\npreview: {}",
+                        "\nexposure: {} lines={} pregain=0x{:02x} postgain=0x{:02x}\nwhite balance: {} gains=[{:02x} {:02x} {:02x}]\npreview: {}{}",
                         ["auto", "locked", "manual"][(e.mode as usize).min(2)],
                         e.exposure,
                         e.pregain,
@@ -61,11 +61,26 @@ impl<'a> ShellCmdApi<'a> for Webcam {
                         e.awb[0],
                         e.awb[1],
                         e.awb[2],
-                        ["off", "full", "zoom"][(e.preview as usize).min(2)]
+                        ["off", "full", "zoom"][(e.preview as usize).min(2)],
+                        if e.rotate { ", rotated 180" } else { "" }
                     )
                     .ok();
                 }
                 None
+            }
+            Some("rotate") => {
+                let on = match tokens.next() {
+                    Some("on") => Some(true),
+                    Some("off") => Some(false),
+                    _ => None,
+                };
+                match on {
+                    Some(on) => match gfx.webcam_rotate(on) {
+                        Ok(_) => write!(ret, "picture {}", if on { "rotated 180" } else { "upright" }).ok(),
+                        Err(e) => write!(ret, "error: {:?}", e).ok(),
+                    },
+                    None => write!(ret, "usage: webcam rotate on|off").ok(),
+                }
             }
             Some("auto") => match gfx.webcam_exposure(ux_api::service::api::WebcamExposureMode::Auto) {
                 Ok(_) => write!(ret, "exposure: auto").ok(),

@@ -870,6 +870,13 @@ impl Gfx {
     #[cfg(feature = "board-baosec")]
     pub fn webcam_white_balance_calibrate(&self) -> Result<(), xous::Error> { self.webcam_tune(7, 2, 0, 0) }
 
+    /// Rotate the picture a half turn (preview and USB stream alike), for a badge hung upside
+    /// down. Persists across capture sessions.
+    #[cfg(feature = "board-baosec")]
+    pub fn webcam_rotate(&self, on: bool) -> Result<(), xous::Error> {
+        self.webcam_tune(8, on as usize, 0, 0)
+    }
+
     /// Tuning knobs: `webcam_tune(4, div, 0, 0)` sets the sensor clock divider used for
     /// full-resolution modes; `webcam_tune(5, page, reg, val)` pokes a sensor register.
     #[cfg(feature = "board-baosec")]
@@ -893,6 +900,7 @@ impl Gfx {
                 mode: (mode & 0xf) as u8,
                 wb_mode: ((mode >> 4) & 0xf) as u8,
                 preview: ((mode >> 8) & 0xf) as u8,
+                rotate: (mode >> 12) & 1 != 0,
                 exposure: exposure as u16,
                 pregain: (gains >> 8) as u8,
                 postgain: gains as u8,
