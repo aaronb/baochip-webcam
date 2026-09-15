@@ -250,8 +250,13 @@ impl Gc2145 {
         let win_h = h * r_ratio;
         let x = ((win_w / c_ratio) - w) / 2;
         let y = ((win_h / r_ratio) - h) / 2;
-        let win_x = (UXGA_HSIZE - win_w) / 2;
-        let win_y = (UXGA_VSIZE - win_h) / 2;
+        // The readout window must start on an even row and column: the ISP demosaics on the
+        // assumption that the first pixel of the window is the first pixel of a Bayer quad, and
+        // an odd start shifts the colour filter phase by one pixel (the red and blue sites land
+        // on real green pixels, so everything comes out green or magenta). The caller's extra
+        // line makes the 768x576 window 1154 rows tall, which put the start at row 23.
+        let win_x = ((UXGA_HSIZE - win_w) / 2) & !1;
+        let win_y = ((UXGA_VSIZE - win_h) / 2) & !1;
 
         /* Set readout window first. */
         self.gc2145_set_window(i2c, GC2145_REG_BLANK_WINDOW_BASE, win_x, win_y, win_w + 16, win_h + 8);
