@@ -275,6 +275,9 @@ impl GlobalConfig {
                 VaultMode::Tour => (true, MEDIUM_TIMEOUT),
                 #[cfg(feature = "tetris")]
                 VaultMode::Tetris => (false, 0),
+                // an appliance: never sleep, even on battery
+                #[cfg(feature = "uvc")]
+                VaultMode::Webcam => (false, 0),
             };
             self.power_manager_config(enable, Some(duration_sec));
         }

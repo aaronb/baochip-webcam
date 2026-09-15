@@ -25,6 +25,10 @@ mod tests;
 #[cfg(feature = "tetris")]
 mod tetris;
 mod vendor_commands;
+#[cfg(feature = "uvc")]
+mod webcam_ui;
+#[cfg(feature = "uvc")]
+mod webcammenu;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::io::{Read, Write};
@@ -77,6 +81,14 @@ pub enum VaultMode {
     TokenHelp,
     #[cfg(feature = "tetris")]
     Tetris,
+    /// USB webcam appliance (`uvc` builds): the only mode the vault runs in
+    #[cfg(feature = "uvc")]
+    Webcam,
+}
+
+#[cfg(feature = "uvc")]
+impl VaultMode {
+    pub fn is_webcam(&self) -> bool { matches!(self, VaultMode::Webcam) }
 }
 
 // `is_tetris()` exists so that call sites in the main loop can test for Tetris mode without
@@ -111,6 +123,8 @@ impl VaultMode {
             VaultMode::Tour => false,
             #[cfg(feature = "tetris")]
             VaultMode::Tetris => false, // we drive redraws ourselves via TetrisTick
+            #[cfg(feature = "uvc")]
+            VaultMode::Webcam => true, // the pumper paces the status page
         }
     }
 }
@@ -169,6 +183,12 @@ fn main() -> ! {
     let gene_menu_mgr = genemenu::create_submenu(conn, actions_conn, gene_menu_sid);
     let idle_menu_sid = xous::create_server().unwrap();
     let idle_menu_mgr = idlemenu::create_submenu(conn, actions_conn, idle_menu_sid);
+    #[cfg(feature = "uvc")]
+    let webcam_menu_sid = xous::create_server().unwrap();
+    #[cfg(feature = "uvc")]
+    let webcam_menu_mgr = webcammenu::create_submenu(conn, actions_conn, webcam_menu_sid);
+    #[cfg(feature = "uvc")]
+    let mut webcam_ui = webcam_ui::WebcamUi::new(&xns);
 
     let modals = modals::Modals::new(&xns).unwrap();
 
@@ -211,10 +231,20 @@ fn main() -> ! {
     let global_config = Arc::new(Mutex::new(global_config));
     *mode.lock().unwrap() = init_mode;
     vault_ui.set_global_config(global_config.clone());
+    #[cfg(feature = "uvc")]
+    {
+        // the appliance: no tour, no token mode, no badge screen
+        *mode.lock().unwrap() = VaultMode::Webcam;
+        webcam_ui.load_settings(&pddb);
+    }
 
     log::info!("Fido2 service");
     let is_fido_unused = Arc::new(AtomicBool::new(false));
     let is_unused_set = Arc::new(AtomicBool::new(false));
+    // The webcam appliance has no FIDO transport (the `uvc` USB build drops the HID
+    // interfaces), so the FIDO handler and its one-time token regeneration (which soft-reboots
+    // on the first boot) are left out.
+    #[cfg(not(feature = "uvc"))]
     fido2::fido2_handler(
         conn,
         allow_host.clone(),
@@ -223,6 +253,10 @@ fn main() -> ! {
         is_fido_unused.clone(),
         is_unused_set.clone(),
     );
+    #[cfg(feature = "uvc")]
+    is_unused_set.store(true, Ordering::SeqCst);
+    #[cfg(feature = "uvc")]
+    let _ = (&opensk_mutex, &allow_host);
 
     // overrides for testing
     #[cfg(feature = "production")]
@@ -442,6 +476,13 @@ fn main() -> ! {
                 if mutation_param % 2 == 0 {
                     log::info!("{}", mutation_param);
                 }*/
+                #[cfg(feature = "uvc")]
+                {
+                    if !menu_active && mode.lock().unwrap().is_webcam() {
+                        webcam_ui.redraw();
+                        continue;
+                    }
+                }
                 if !menu_active {
                     // Tetris paints its own board from the TetrisTick handler; letting the
                     // periodic pumper redraw run here would paint the item-list UI over it.
@@ -471,6 +512,14 @@ fn main() -> ! {
             }
             Some(VaultOp::MenuDone) => {
                 menu_active = false;
+                #[cfg(feature = "uvc")]
+                {
+                    if mode.lock().unwrap().is_webcam() {
+                        animate.store(true, Ordering::SeqCst);
+                        webcam_ui.menu_closed();
+                        continue;
+                    }
+                }
                 if mode.lock().unwrap().is_tetris() {
                     #[cfg(feature = "tetris")]
                     {
@@ -517,6 +566,13 @@ fn main() -> ! {
                     jig_ready_seen = true;
                 }
                 if menu_active {
+                    #[cfg(feature = "uvc")]
+                    {
+                        if mode_now.is_webcam() {
+                            webcam_menu_mgr.key_press(k);
+                            continue;
+                        }
+                    }
                     if matches!(mode_now, VaultMode::Tour) {
                         tour_menu_mgr.key_press(k);
                     } else if matches!(mode_now, VaultMode::ConfirmGene) {
@@ -583,6 +639,20 @@ fn main() -> ! {
                         }
                     }
                 } else {
+                    #[cfg(feature = "uvc")]
+                    {
+                        if mode_now.is_webcam() {
+                            if k == '∴' {
+                                animate.store(false, Ordering::SeqCst);
+                                webcam_ui.menu_open();
+                                webcam_menu_mgr.redraw();
+                                menu_active = true;
+                            } else {
+                                webcam_ui.key(k);
+                            }
+                            continue;
+                        }
+                    }
                     // let the UI get first whack at filtering keys - the '∴' key may be intercepted
                     // by various test routines
                     let k = vault_ui.handle_key(k);
@@ -1174,6 +1244,10 @@ fn main() -> ! {
             Some(VaultOp::PowerOff) => {
                 global_config.lock().unwrap().power_off();
                 *mode.lock().unwrap() = VaultMode::Idle;
+                #[cfg(feature = "uvc")]
+                {
+                    *mode.lock().unwrap() = VaultMode::Webcam;
+                }
                 modals
                     .dynamic_notification(
                         None,
@@ -1200,6 +1274,10 @@ fn main() -> ! {
             Some(VaultOp::ScreenOff) => {
                 global_config.lock().unwrap().screen_off();
             }
+            #[cfg(feature = "uvc")]
+            Some(VaultOp::WebcamMenu) => xous::msg_scalar_unpack!(msg, item, _, _, _, {
+                webcam_ui.menu_action(item);
+            }),
             Some(VaultOp::ImageLoad) => xous::msg_scalar_unpack!(msg, load, _, _, _, {
                 if load == 0 {
                     vault_ui.user_bitmap.take();

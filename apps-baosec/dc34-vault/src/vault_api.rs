@@ -69,6 +69,8 @@ pub(crate) enum VaultOp {
 
     // Note: these sit before the explicitly-numbered ImageLoad = 1024, so gating them out
     // leaves every other opcode's discriminant unchanged.
+    #[cfg(feature = "uvc")]
+    WebcamMenu,
     #[cfg(feature = "tetris")]
     MenuTetris,
     #[cfg(feature = "tetris")]

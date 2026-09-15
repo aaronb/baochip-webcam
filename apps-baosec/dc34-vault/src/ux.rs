@@ -1447,6 +1447,12 @@ impl VaultUi {
                 // Intentionally blank: Tetris owns its own render loop in main.rs and never
                 // calls VaultUi::redraw(). This arm only exists for exhaustiveness.
             }
+            #[cfg(feature = "uvc")]
+            VaultMode::Webcam => {
+                // the webcam UI paints its own page from main.rs; nothing of ours may flush
+                // over it
+                return;
+            }
         }
         self.gfx.flush().ok();
         self.last_mode = (*self.mode.lock().unwrap()).clone();

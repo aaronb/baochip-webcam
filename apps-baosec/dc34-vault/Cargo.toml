@@ -125,6 +125,11 @@ uber = []
 # Tetris minigame. Build with `--features tetris` to include it.
 tetris = []
 
+# USB webcam appliance: the buttons and menu drive the webcam (exposure, white balance, OLED
+# preview) and the badge's own features are idle. Matches the `uvc` feature of bao-video and
+# usb-bao1x, so one `--feature uvc` builds the whole appliance.
+uvc = []
+
 # when selected, resets the badge state to factory new
 factory-new = []
 qa-test = []
