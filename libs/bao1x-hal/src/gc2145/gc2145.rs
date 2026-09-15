@@ -115,62 +115,49 @@ impl Gc2145 {
         Gc2145Exposure { exposure, pregain, postgain, awb, aec_on, awb_on }
     }
 
-    /// Freeze exposure and white balance at their current values: disable the AEC and AWB
-    /// engines and write the values they had reached back as manual settings. Returns the
-    /// frozen state.
+    /// Freeze exposure at its current value: disable the AEC engine and write the values it
+    /// had reached back as manual settings. White balance is left as it is. Returns the frozen
+    /// state.
     pub fn lock_exposure(&self, i2c: &mut dyn I2cApi) -> Gc2145Exposure {
         let cur = self.read_exposure(i2c);
-        self.set_exposure(i2c, cur.exposure, cur.pregain, cur.postgain, Some(cur.awb));
-        Gc2145Exposure { aec_on: false, awb_on: false, ..cur }
+        self.set_exposure(i2c, cur.exposure, cur.pregain, cur.postgain);
+        Gc2145Exposure { aec_on: false, ..cur }
     }
 
-    /// Manual exposure: AEC and AWB off, `exposure` in line units (13 bits), gains in the
-    /// sensor's 4.4 fixed-point format (0x40 = 1.0). `awb` gains are R, G, B; `None` leaves the
-    /// current white-balance gains in place.
-    pub fn set_exposure(
-        &self,
-        i2c: &mut dyn I2cApi,
-        exposure: u16,
-        pregain: u8,
-        postgain: u8,
-        awb: Option<[u8; 3]>,
-    ) {
-        self.poke(i2c, GC2145_REG_RESET, GC2145_SET_P0_REGS);
-        let mut b = [0u8; 1];
-        self.peek(i2c, 0xb6, &mut b);
-        self.poke(i2c, 0xb6, b[0] & !0x01);
-        self.peek(i2c, 0x82, &mut b);
-        self.poke(i2c, 0x82, b[0] & !0x02);
+    /// Manual exposure: AEC off, `exposure` in line units (13 bits), gains in the sensor's 4.4
+    /// fixed-point format (0x40 = 1.0). White balance is not touched.
+    pub fn set_exposure(&self, i2c: &mut dyn I2cApi, exposure: u16, pregain: u8, postgain: u8) {
+        self.set_aec_enable(i2c, false);
         self.poke(i2c, 0x03, ((exposure >> 8) & 0x1f) as u8);
         self.poke(i2c, 0x04, (exposure & 0xff) as u8);
         self.poke(i2c, 0xb1, pregain);
         self.poke(i2c, 0xb2, postgain);
-        if let Some([r, g, bb]) = awb {
-            self.poke(i2c, 0xb3, r);
-            self.poke(i2c, 0xb4, g);
-            self.poke(i2c, 0xb5, bb);
-        }
     }
 
     /// Manual white balance: AWB off, gains R, G, B in 4.4 fixed point (0x40 = 1.0).
     pub fn set_awb_gains(&self, i2c: &mut dyn I2cApi, awb: [u8; 3]) {
-        self.poke(i2c, GC2145_REG_RESET, GC2145_SET_P0_REGS);
-        let mut b = [0u8; 1];
-        self.peek(i2c, 0x82, &mut b);
-        self.poke(i2c, 0x82, b[0] & !0x02);
+        self.set_awb_enable(i2c, false);
         self.poke(i2c, 0xb3, awb[0]);
         self.poke(i2c, 0xb4, awb[1]);
         self.poke(i2c, 0xb5, awb[2]);
     }
 
-    /// Hand exposure and white balance back to the sensor's automatic engines.
-    pub fn unlock_exposure(&self, i2c: &mut dyn I2cApi) {
+    /// Turn the sensor's automatic exposure engine on or off (page 0 register 0xb6 bit 0).
+    /// Switching it off leaves the exposure and gains at the values it last wrote.
+    pub fn set_aec_enable(&self, i2c: &mut dyn I2cApi, on: bool) {
         self.poke(i2c, GC2145_REG_RESET, GC2145_SET_P0_REGS);
         let mut b = [0u8; 1];
         self.peek(i2c, 0xb6, &mut b);
-        self.poke(i2c, 0xb6, b[0] | 0x01);
+        self.poke(i2c, 0xb6, if on { b[0] | 0x01 } else { b[0] & !0x01 });
+    }
+
+    /// Turn the sensor's automatic white-balance engine on or off (page 0 register 0x82 bit 1).
+    /// Switching it off leaves the gains at the values it last wrote.
+    pub fn set_awb_enable(&self, i2c: &mut dyn I2cApi, on: bool) {
+        self.poke(i2c, GC2145_REG_RESET, GC2145_SET_P0_REGS);
+        let mut b = [0u8; 1];
         self.peek(i2c, 0x82, &mut b);
-        self.poke(i2c, 0x82, b[0] | 0x02);
+        self.poke(i2c, 0x82, if on { b[0] | 0x02 } else { b[0] & !0x02 });
     }
 
     pub fn release_ifram(&mut self) {
@@ -332,7 +319,8 @@ impl Gc2145 {
             self.poke(i2c, adr, dat);
         }
 
-        // set up YUV mode
+        // set up YUV mode. The luma-only consumers (QR scanning) do not care about the chroma
+        // order; the webcam does, see `GC2145_REG_OUTPUT_FMT_YCRYCB`.
         self.poke(i2c, GC2145_REG_RESET, GC2145_SET_P0_REGS);
         self.delay(30);
         let mut buf = [0u8; 1];
@@ -341,7 +329,7 @@ impl Gc2145 {
         self.poke(
             i2c,
             GC2145_REG_OUTPUT_FMT,
-            (buf[0] & !GC2145_REG_OUTPUT_FMT_MASK) | GC2145_REG_OUTPUT_FMT_YCBYCR,
+            (buf[0] & !GC2145_REG_OUTPUT_FMT_MASK) | GC2145_REG_OUTPUT_FMT_YCRYCB,
         );
         self.delay(30);
 

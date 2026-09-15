@@ -134,14 +134,19 @@ pub enum GfxOpcode {
     /// Internal: checks that frames are arriving after a webcam start; restarts the camera if not
     #[cfg(feature = "board-baosec")]
     WebcamWatchdog,
-    /// Exposure control (blocking scalar). arg1: 0 = auto, 1 = lock at the current values,
-    /// 2 = manual with arg2 = exposure lines, arg3 = pre-gain, arg4 = post-gain (4.4 fixed point).
-    /// The setting persists across capture sessions. Reply arg1 = 1 on success.
+    /// Exposure, white balance and preview control (blocking scalar). arg1 selects:
+    /// 0 = auto exposure, 1 = lock exposure at the current values, 2 = manual exposure with
+    /// arg2 = exposure lines, arg3 = pre-gain, arg4 = post-gain (4.4 fixed point);
+    /// 3 = manual white balance, arg2..arg4 = R, G, B gains; 7 = white balance mode, arg2 = 0
+    /// for the sensor's own engine, 2 for a one-shot grey-world calibration that ends in manual
+    /// gains; 6 = preview, arg2 = 0 off, 1 full frame, 2 centre crop; 4 and 5 are tuning knobs.
+    /// Settings persist across capture sessions. Reply arg1 = 1 on success.
     #[cfg(feature = "board-baosec")]
     WebcamExposure,
-    /// Blocking scalar; returns arg1 = mode (0 auto, 1 locked, 2 manual), arg2 = exposure lines,
-    /// arg3 = pre-gain << 8 | post-gain, arg4 = AWB R << 16 | G << 8 | B. Live values while the
-    /// camera is on, otherwise the last seen.
+    /// Blocking scalar; returns arg1 = exposure mode (0 auto, 1 locked, 2 manual) | white
+    /// balance mode << 4 (0 sensor auto, 1 manual, 2 calibrating) | preview view << 8,
+    /// arg2 = exposure lines, arg3 = pre-gain << 8 | post-gain, arg4 = AWB R << 16 | G << 8 | B.
+    /// Live values while the camera is on, otherwise the last seen.
     #[cfg(feature = "board-baosec")]
     WebcamExposureStatus,
 
@@ -224,6 +229,10 @@ pub enum WebcamExposureMode {
 pub struct WebcamExposureStatus {
     /// 0 auto, 1 locked, 2 manual
     pub mode: u8,
+    /// 0 sensor's automatic engine, 1 manual gains, 2 grey-world calibration in progress
+    pub wb_mode: u8,
+    /// OLED preview: 0 off (the UI's own screen shows), 1 full frame, 2 centre crop
+    pub preview: u8,
     pub exposure: u16,
     pub pregain: u8,
     pub postgain: u8,

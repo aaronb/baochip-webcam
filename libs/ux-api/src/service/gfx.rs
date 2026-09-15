@@ -854,6 +854,22 @@ impl Gfx {
         self.webcam_tune(6, on as usize, 0, 0)
     }
 
+    /// OLED preview view: 0 off, 1 full frame, 2 centre crop at 1:1 (an aiming aid).
+    #[cfg(feature = "board-baosec")]
+    pub fn webcam_preview_view(&self, view: u8) -> Result<(), xous::Error> {
+        self.webcam_tune(6, view.min(2) as usize, 0, 0)
+    }
+
+    /// Hand white balance back to the sensor's automatic engine.
+    #[cfg(feature = "board-baosec")]
+    pub fn webcam_white_balance_auto(&self) -> Result<(), xous::Error> { self.webcam_tune(7, 0, 0, 0) }
+
+    /// One-shot grey-world white balance: the video server adjusts the R and B gains over the
+    /// next frames until the picture's average colour is neutral, then leaves them as manual
+    /// gains. Point the camera at something grey or white first.
+    #[cfg(feature = "board-baosec")]
+    pub fn webcam_white_balance_calibrate(&self) -> Result<(), xous::Error> { self.webcam_tune(7, 2, 0, 0) }
+
     /// Tuning knobs: `webcam_tune(4, div, 0, 0)` sets the sensor clock divider used for
     /// full-resolution modes; `webcam_tune(5, page, reg, val)` pokes a sensor register.
     #[cfg(feature = "board-baosec")]
@@ -874,7 +890,9 @@ impl Gfx {
             Message::new_blocking_scalar(GfxOpcode::WebcamExposureStatus.to_usize().unwrap(), 0, 0, 0, 0),
         )? {
             xous::Result::Scalar5(_, mode, exposure, gains, awb) => Ok(WebcamExposureStatus {
-                mode: mode as u8,
+                mode: (mode & 0xf) as u8,
+                wb_mode: ((mode >> 4) & 0xf) as u8,
+                preview: ((mode >> 8) & 0xf) as u8,
                 exposure: exposure as u16,
                 pregain: (gains >> 8) as u8,
                 postgain: gains as u8,

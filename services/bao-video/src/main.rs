@@ -251,7 +251,30 @@ struct WebcamState {
     exposure_applied: bool,
     /// last exposure state read from the sensor
     exposure: bao1x_hal::gc2145::Gc2145Exposure,
+    /// white balance handling; persists across sessions
+    wb_mode: WbMode,
+    /// grey-world calibration: frames left in its budget (0 = not calibrating)
+    wb_calibrating: u8,
+    /// grey-world accumulators over the frame being measured: sum Y, sum U, sum V, samples
+    wb_acc: [u64; 4],
+    /// preview shows a 1:1 centre crop instead of the whole frame
+    preview_zoom: bool,
 }
+
+/// White balance handling for the webcam.
+#[cfg(feature = "uvc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WbMode {
+    /// the sensor's own engine
+    Auto,
+    /// fixed gains R, G, B (4.4 fixed point, 0x40 = 1.0)
+    Manual([u8; 3]),
+}
+
+/// Frame budget of a grey-world calibration: gains are evaluated on every other frame, so
+/// this is twelve damped adjustments at most (about two seconds at the sensor's frame rate).
+#[cfg(feature = "uvc")]
+const WB_CAL_FRAMES: u8 = 24;
 
 #[cfg(feature = "uvc")]
 impl WebcamState {
@@ -287,8 +310,27 @@ impl WebcamState {
             exposure_mode: WebcamExposureMode::Auto,
             exposure_applied: false,
             exposure: Default::default(),
+            wb_mode: WbMode::Auto,
+            wb_calibrating: 0,
+            wb_acc: [0; 4],
+            preview_zoom: false,
         }
     }
+}
+
+/// Apply the persistent exposure and white-balance settings to a freshly started sensor.
+#[cfg(feature = "uvc")]
+fn webcam_apply_settings(cam: &mut Gc2145, i2c: &mut I2c, webcam: &mut WebcamState) {
+    webcam.exposure_applied = false;
+    if let WebcamExposureMode::Manual { exposure, pregain, postgain } = webcam.exposure_mode {
+        cam.set_exposure(i2c, exposure, pregain, postgain);
+        webcam.exposure_applied = true;
+    }
+    if let WbMode::Manual(gains) = webcam.wb_mode {
+        cam.set_awb_gains(i2c, gains);
+    }
+    webcam.wb_calibrating = 0;
+    webcam.exposure = cam.read_exposure(i2c);
 }
 
 /// Bring the camera out of power-down: start MCLK, release PWDN. Mirrors the sequence used for QR
@@ -452,8 +494,8 @@ fn webcam_ring_start_frame(cam: &mut Gc2145, ring: &RingGeometry, webcam: &mut W
 #[cfg(feature = "uvc")]
 const PREVIEW_ROWS: usize = 116;
 #[cfg(feature = "uvc")]
-fn preview_geometry(mode: &UvcMode) -> (usize, usize, usize, usize) {
-    let step = (mode.width / 128).max(1);
+fn preview_geometry(mode: &UvcMode, zoom: bool) -> (usize, usize, usize, usize) {
+    let step = if zoom { 1 } else { (mode.width / 128).max(1) };
     let cols = (mode.width / step).min(128);
     let rows = (mode.height / step).min(PREVIEW_ROWS);
     let x0 = (mode.width - cols * step) / 2;
@@ -464,9 +506,9 @@ fn preview_geometry(mode: &UvcMode) -> (usize, usize, usize, usize) {
 /// Render image rows `first_row..first_row + n` (from a chunk buffer holding exactly those rows,
 /// UYVY, `mode.width` wide) into the preview framebuffer with an ordered 4x4 dither.
 #[cfg(feature = "uvc")]
-fn webcam_preview_rows(fb: &mut [u32], src: &[u32], mode: &UvcMode, first_row: usize, n: usize) {
+fn webcam_preview_rows(fb: &mut [u32], src: &[u32], mode: &UvcMode, zoom: bool, first_row: usize, n: usize) {
     const BAYER: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
-    let (step, x0, y0, rows) = preview_geometry(mode);
+    let (step, x0, y0, rows) = preview_geometry(mode, zoom);
     let words_per_row = mode.width * 2 / core::mem::size_of::<u32>();
     for r in 0..n {
         let img_row = first_row + r;
@@ -504,6 +546,7 @@ fn webcam_preview_status(
     display: &mut Oled128x128,
     mode: &UvcMode,
     exposure_mode: WebcamExposureMode,
+    wb: char,
     fps_x10: u32,
     preview_fb: &mut [u32],
     screen_size: Point,
@@ -513,7 +556,7 @@ fn webcam_preview_status(
         WebcamExposureMode::Lock => 'L',
         WebcamExposureMode::Manual { .. } => 'M',
     };
-    let text = format!("{}x{} {} {}.{}fps", mode.width, mode.height, exp, fps_x10 / 10, fps_x10 % 10);
+    let text = format!("{}x{} {}/{} {}.{}fps", mode.width, mode.height, exp, wb, fps_x10 / 10, fps_x10 % 10);
     let words_per_row = bao1x_hal::sh1107::COLUMN as usize / 32;
     let lo = PREVIEW_ROWS * words_per_row;
     let hi = display.buffer().len();
@@ -540,6 +583,110 @@ const PREVIEW_COLS: usize = bao1x_hal::sh1107::COLUMN as usize;
 #[cfg(feature = "uvc")]
 fn preview_cols_per_step(transfers: usize) -> usize {
     ((PREVIEW_COLS + 2 * transfers - 1) / (2 * transfers)).clamp(4, 16)
+}
+
+/// One-letter white balance state for the preview's status line.
+#[cfg(feature = "uvc")]
+fn webcam_wb_marker(webcam: &WebcamState) -> char {
+    if webcam.wb_calibrating > 0 {
+        'c'
+    } else {
+        match webcam.wb_mode {
+            WbMode::Auto => 'a',
+            WbMode::Manual(_) => 'm',
+        }
+    }
+}
+
+/// Grey-world calibration, measurement half: add a sparse sample of the chunk just copied into
+/// the frame buffer (`rows` UYVY lines of `mode.width`) to the accumulators.
+#[cfg(feature = "uvc")]
+fn webcam_wb_accumulate(webcam: &mut WebcamState, mode: &UvcMode, rows: usize) {
+    let src = unsafe { webcam.frame.as_slice::<u32>() };
+    let words_per_row = mode.width * 2 / core::mem::size_of::<u32>();
+    let acc = &mut webcam.wb_acc;
+    for r in (0..rows).step_by(4) {
+        let line = &src[r * words_per_row..][..words_per_row];
+        for &w in line.iter().step_by(4) {
+            // word = [U, Y0, V, Y1] from the low byte up
+            acc[0] += ((((w >> 8) & 0xff) + (w >> 24)) / 2) as u64;
+            acc[1] += (w & 0xff) as u64;
+            acc[2] += ((w >> 16) & 0xff) as u64;
+            acc[3] += 1;
+        }
+    }
+}
+
+/// Grey-world calibration, adjustment half, run once a measured frame is complete: derive the
+/// frame's mean R, G, B from its mean Y, U, V and scale the R and B gains so the means match
+/// G. Converges in a few rounds; the sensor's gains are 4.4 fixed point.
+#[cfg(feature = "uvc")]
+fn webcam_wb_step(cam: &mut Gc2145, i2c: &mut I2c, webcam: &mut WebcamState) {
+    let acc = webcam.wb_acc;
+    webcam.wb_acc = [0; 4];
+    let n = acc[3].max(1) as f32;
+    let y = acc[0] as f32 / n;
+    let u = acc[1] as f32 / n - 128.0;
+    let v = acc[2] as f32 / n - 128.0;
+    let r = y + 1.402 * v;
+    let g = y - 0.344 * u - 0.714 * v;
+    let b = y + 1.772 * u;
+    let gains = match webcam.wb_mode {
+        WbMode::Manual(gains) => gains,
+        WbMode::Auto => webcam.exposure.awb,
+    };
+    if y < 8.0 {
+        log::warn!(
+            "webcam: white balance calibration: picture too dark (Y {:.0}), keeping {:02x?}",
+            y,
+            gains
+        );
+        webcam.wb_calibrating = 0;
+        return;
+    }
+    // The ISP's colour matrix couples the channels (raising G lowers B, and so on), so a full
+    // step overshoots: take the square root of the correction, capped, and iterate.
+    let (r, g, b) = (r.max(1.0), g.max(1.0), b.max(1.0));
+    let ratio_r = g / r;
+    let ratio_b = g / b;
+    let damp = |ratio: f32| ratio.clamp(0.5, 2.0).sqrt();
+    // The correction is a ratio against G. If R or B would fall below the floor, raise the
+    // other gains instead: the picture's balance is what matters, and the exposure engine
+    // (or the user) sets the level.
+    const GAIN_MIN: f32 = 0x20 as f32;
+    const GAIN_MAX: f32 = 0xf0 as f32;
+    let mut want = [gains[0] as f32 * damp(ratio_r), gains[1] as f32, gains[2] as f32 * damp(ratio_b)];
+    let lowest = want[0].min(want[1]).min(want[2]);
+    if lowest < GAIN_MIN {
+        let up = GAIN_MIN / lowest;
+        for w in want.iter_mut() {
+            *w *= up;
+        }
+    }
+    let new_gains = [
+        want[0].round().clamp(GAIN_MIN, GAIN_MAX) as u8,
+        want[1].round().clamp(GAIN_MIN, GAIN_MAX) as u8,
+        want[2].round().clamp(GAIN_MIN, GAIN_MAX) as u8,
+    ];
+    let converged = (ratio_r - 1.0).abs() < 0.03 && (ratio_b - 1.0).abs() < 0.03;
+    log::info!(
+        "webcam: white balance step: mean RGB {:.0}/{:.0}/{:.0}, gains {:02x?} -> {:02x?}{}",
+        r,
+        g,
+        b,
+        gains,
+        new_gains,
+        if converged { " (done)" } else { "" }
+    );
+    if new_gains != gains {
+        cam.set_awb_gains(i2c, new_gains);
+        webcam.exposure.awb = new_gains;
+    }
+    webcam.wb_mode = WbMode::Manual(new_gains);
+    webcam.wb_calibrating = if converged { 0 } else { webcam.wb_calibrating.saturating_sub(1) };
+    if webcam.wb_calibrating == 0 && !converged {
+        log::warn!("webcam: white balance calibration ran out of frames; keeping the last gains");
+    }
 }
 
 /// Schedule a `WebcamWatchdog` check: if no frame has arrived by then, the camera is restarted.
@@ -1119,6 +1266,15 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                     dst[r * dst_words..][..dst_words].copy_from_slice(src);
                                 }
                             }
+                            if webcam.wb_calibrating > 0 && webcam.wb_calibrating % 2 == 0 {
+                                // measure on even counts, let the new gains settle on odd ones
+                                webcam_wb_accumulate(&mut webcam, &mode, rows);
+                                if last {
+                                    webcam_wb_step(&mut cam, &mut i2c, &mut webcam);
+                                }
+                            } else if last && webcam.wb_calibrating > 0 {
+                                webcam.wb_calibrating -= 1;
+                            }
                             if ring.depth < 3 {
                                 if webcam.xfer_queued < ring.transfers {
                                     webcam_ring_enqueue(&mut cam, &ring, &mut webcam);
@@ -1132,6 +1288,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                     &mut webcam.preview_fb,
                                     src,
                                     &mode,
+                                    webcam.preview_zoom,
                                     k * ring.slot_rows,
                                     rows,
                                 );
@@ -1172,6 +1329,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                         &mut display,
                                         &mode,
                                         webcam.exposure_mode,
+                                        webcam_wb_marker(&webcam),
                                         webcam.fps_x10,
                                         &mut webcam.preview_fb,
                                         screen_size,
@@ -1208,6 +1366,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                     &udma_global,
                                     &mut webcam,
                                 );
+                                webcam_apply_settings(&mut cam, &mut i2c, &mut webcam);
                                 break;
                             }
                         }
@@ -1462,14 +1621,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                 &udma_global,
                                 &mut webcam,
                             );
-                            webcam.exposure_applied = false;
-                            if let WebcamExposureMode::Manual { exposure, pregain, postgain } =
-                                webcam.exposure_mode
-                            {
-                                cam.set_exposure(&mut i2c, exposure, pregain, postgain, None);
-                                webcam.exposure = cam.read_exposure(&mut i2c);
-                                webcam.exposure_applied = true;
-                            }
+                            webcam_apply_settings(&mut cam, &mut i2c, &mut webcam);
                             webcam_arm_watchdog(cid, webcam.captured, &tt);
                             log::info!("webcam started");
                         }
@@ -1517,6 +1669,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                     &udma_global,
                                     &mut webcam,
                                 );
+                                webcam_apply_settings(&mut cam, &mut i2c, &mut webcam);
                                 webcam_arm_watchdog(cid, webcam.captured, &tt);
                             } else {
                                 log::error!("webcam: camera never produced a frame; giving up");
@@ -1535,7 +1688,9 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                     };
                     if a1 == 6 {
                         webcam.preview = a2 != 0;
+                        webcam.preview_zoom = a2 == 2;
                         webcam.preview_col = 0;
+                        webcam.preview_fb.fill(!0);
                         if !webcam.preview {
                             // the UI's buffer is intact (the preview never painted it): show it
                             if webcam.active {
@@ -1588,13 +1743,47 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                     if a1 == 3 {
                         // white balance gains only (R, G, B in 4.4 fixed point); leaves the
                         // exposure mode alone
+                        let gains = [a2 as u8, a3 as u8, a4 as u8];
+                        webcam.wb_mode = WbMode::Manual(gains);
+                        webcam.wb_calibrating = 0;
                         if webcam.active {
-                            cam.set_awb_gains(&mut i2c, [a2 as u8, a3 as u8, a4 as u8]);
+                            cam.set_awb_gains(&mut i2c, gains);
                             webcam.exposure = cam.read_exposure(&mut i2c);
                             log::info!("webcam: white balance -> {:?}", webcam.exposure);
                         }
                         if let Some(scalar) = msg.body.scalar_message_mut() {
                             scalar.arg1 = 1;
+                        }
+                        continue;
+                    }
+                    if a1 == 7 {
+                        // white balance mode: 0 = the sensor's engine, 2 = grey-world calibration
+                        let mut ok = true;
+                        if a2 == 2 {
+                            if webcam.active {
+                                // start from the gains in force, with the engine off
+                                let cur = cam.read_exposure(&mut i2c);
+                                cam.set_awb_gains(&mut i2c, cur.awb);
+                                webcam.exposure = cam.read_exposure(&mut i2c);
+                                webcam.wb_mode = WbMode::Manual(cur.awb);
+                                webcam.wb_calibrating = WB_CAL_FRAMES;
+                                webcam.wb_acc = [0; 4];
+                                log::info!("webcam: white balance calibration from {:02x?}", cur.awb);
+                            } else {
+                                log::warn!("webcam: white balance calibration needs the camera running");
+                                ok = false;
+                            }
+                        } else {
+                            webcam.wb_mode = WbMode::Auto;
+                            webcam.wb_calibrating = 0;
+                            if webcam.active {
+                                cam.set_awb_enable(&mut i2c, true);
+                                webcam.exposure = cam.read_exposure(&mut i2c);
+                            }
+                            log::info!("webcam: white balance -> sensor auto");
+                        }
+                        if let Some(scalar) = msg.body.scalar_message_mut() {
+                            scalar.arg1 = ok as usize;
                         }
                         continue;
                     }
@@ -1611,7 +1800,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                     if webcam.active {
                         match webcam.exposure_mode {
                             WebcamExposureMode::Auto => {
-                                cam.unlock_exposure(&mut i2c);
+                                cam.set_aec_enable(&mut i2c, true);
                                 webcam.exposure = cam.read_exposure(&mut i2c);
                             }
                             WebcamExposureMode::Lock => {
@@ -1619,7 +1808,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                 webcam.exposure_applied = true;
                             }
                             WebcamExposureMode::Manual { exposure, pregain, postgain } => {
-                                cam.set_exposure(&mut i2c, exposure, pregain, postgain, None);
+                                cam.set_exposure(&mut i2c, exposure, pregain, postgain);
                                 webcam.exposure = cam.read_exposure(&mut i2c);
                                 webcam.exposure_applied = true;
                             }
@@ -1636,12 +1825,41 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                         webcam.exposure = cam.read_exposure(&mut i2c);
                     }
                     if let Some(scalar) = msg.body.scalar_message_mut() {
-                        let e = webcam.exposure;
+                        let mut e = webcam.exposure;
+                        if !webcam.active {
+                            // report the settings that will apply, not the stale sensor read
+                            if let WebcamExposureMode::Manual { exposure, pregain, postgain } =
+                                webcam.exposure_mode
+                            {
+                                e.exposure = exposure;
+                                e.pregain = pregain;
+                                e.postgain = postgain;
+                            }
+                            if let WbMode::Manual(gains) = webcam.wb_mode {
+                                e.awb = gains;
+                            }
+                        }
+                        let wb = if webcam.wb_calibrating > 0 {
+                            2
+                        } else {
+                            match webcam.wb_mode {
+                                WbMode::Auto => 0,
+                                WbMode::Manual(_) => 1,
+                            }
+                        };
+                        let view = if !webcam.preview {
+                            0
+                        } else if webcam.preview_zoom {
+                            2
+                        } else {
+                            1
+                        };
                         scalar.arg1 = match webcam.exposure_mode {
                             WebcamExposureMode::Auto => 0,
                             WebcamExposureMode::Lock => 1,
                             WebcamExposureMode::Manual { .. } => 2,
-                        };
+                        } | (wb << 4)
+                            | (view << 8);
                         scalar.arg2 = e.exposure as usize;
                         scalar.arg3 = (e.pregain as usize) << 8 | e.postgain as usize;
                         scalar.arg4 =
