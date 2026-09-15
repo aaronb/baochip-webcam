@@ -44,6 +44,12 @@ fn shell() {
         match console_op {
             Some(ConsoleOp::Keypress) => msg_scalar_unpack!(msg, k1, _k2, _k3, _k4, {
                 let k = char::from_u32(k1 as u32).unwrap_or('\u{0000}');
+                if matches!(k, '←' | '→' | '↑' | '↓' | '🔥' | '∴' | '🔼' | '🔽' | '⏰' | '⏯')
+                {
+                    // The badge's buttons (and the `key` command that injects them) drive the
+                    // UI apps, not this text REPL: a press must not land in the input line.
+                    continue;
+                }
                 if k1 == 0x08 {
                     // backspace character
                     input.pop(); // returns None if empty

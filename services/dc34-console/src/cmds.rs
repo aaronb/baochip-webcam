@@ -83,7 +83,11 @@ use image::*;
 mod bio;
 use bio::*;
 #[cfg(feature = "board-baosec")]
+mod key;
+#[cfg(feature = "board-baosec")]
 mod webcam;
+#[cfg(feature = "board-baosec")]
+use key::*;
 #[cfg(feature = "board-baosec")]
 use webcam::*;
 
@@ -127,6 +131,8 @@ impl CmdEnv {
         let mut ver_cmd = Ver {};
         #[cfg(feature = "board-baosec")]
         let mut webcam_cmd = Webcam {};
+        #[cfg(feature = "board-baosec")]
+        let mut key_cmd = Key {};
 
         let commands: &mut [&mut dyn ShellCmdApi] = &mut [
             ///// 4. add your command to this array, so that it can be looked up and dispatched
@@ -134,6 +140,8 @@ impl CmdEnv {
             &mut ver_cmd,
             #[cfg(feature = "board-baosec")]
             &mut webcam_cmd,
+            #[cfg(feature = "board-baosec")]
+            &mut key_cmd,
             &mut self.test,
             &mut self.image,
             &mut self.bio,
