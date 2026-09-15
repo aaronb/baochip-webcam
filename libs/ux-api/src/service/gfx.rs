@@ -831,8 +831,17 @@ impl Gfx {
     }
 
     /// Camera bring-up: start capture in an arbitrary geometry (not a host-selectable mode).
+    /// `rowlen` (0 for the padded width) sets the camera DMA's row length on its own: the DMA
+    /// splits lines by counting samples, so this measures what the sensor really puts in a line.
     #[cfg(feature = "board-baosec")]
-    pub fn webcam_raw(&self, w: usize, h: usize, ratio: usize, pad: usize) -> Result<bool, xous::Error> {
+    pub fn webcam_raw(
+        &self,
+        w: usize,
+        h: usize,
+        ratio: usize,
+        pad: usize,
+        rowlen: usize,
+    ) -> Result<bool, xous::Error> {
         match send_message(
             self.conn,
             Message::new_blocking_scalar(
@@ -840,7 +849,7 @@ impl Gfx {
                 1,
                 2,
                 (w << 16) | (h & 0xffff),
-                (ratio << 8) | (pad & 0xff),
+                ((rowlen & 0xffff) << 16) | ((ratio & 0xff) << 8) | (pad & 0xff),
             ),
         )? {
             xous::Result::Scalar5(_, active, _, _, _) => Ok(active != 0),

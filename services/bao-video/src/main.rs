@@ -213,6 +213,8 @@ struct WebcamState {
     /// (measured 2026-09-15 at 768x576 and 160x120 on scenes with a dark right edge); the 3-word
     /// stale prefix measured with the earlier free-running capture is gone.
     crop_words: usize,
+    /// console bring-up geometry only: camera DMA row length instead of the padded width (0 = off)
+    rowlen_override: usize,
     /// index into `UVC_MODES` of the mode being captured
     mode: usize,
     /// a console-defined geometry for camera bring-up, used instead of `UVC_MODES[mode]` when set
@@ -300,6 +302,7 @@ impl WebcamState {
             dropped: 0,
             restarts: 0,
             crop_words: 0,
+            rowlen_override: 0,
             mode: 0,
             custom: None,
             xfer_queued: 0,
@@ -429,9 +432,13 @@ fn webcam_start_capture(
         cam.poke(i2c, 0xfe, 0x00);
         cam.poke(i2c, 0xfa, clkdiv_ratio1);
     }
-    cam.set_slicing((0, 0), (mode.line_px(), mode.height + 1));
+    let line_px = webcam_line_px(webcam, &mode);
+    if line_px != mode.line_px() {
+        cam.set_row_length(line_px);
+    }
+    cam.set_slicing((0, 0), (line_px, mode.height + 1));
     cam.set_sof_sync(false);
-    let ring = webcam_ring_geometry(cam, &mode);
+    let ring = webcam_ring_geometry(cam, &mode, line_px);
     if ring.transfers > 1 && ring.depth < 3 {
         log::warn!(
             "webcam: {}x{} ring has only {} slots; the frame re-arm waits for the last copy",
@@ -479,9 +486,20 @@ struct RingGeometry {
     transfers: usize,
 }
 
+/// Samples per captured line as the camera DMA counts them: the mode's padded width, unless a
+/// console bring-up geometry overrides the DMA row length.
 #[cfg(feature = "uvc")]
-fn webcam_ring_geometry(cam: &Gc2145, mode: &UvcMode) -> RingGeometry {
-    let line_bytes = mode.line_px() * 2;
+fn webcam_line_px(webcam: &WebcamState, mode: &UvcMode) -> usize {
+    if webcam.custom.is_some() && webcam.rowlen_override != 0 {
+        webcam.rowlen_override
+    } else {
+        mode.line_px()
+    }
+}
+
+#[cfg(feature = "uvc")]
+fn webcam_ring_geometry(cam: &Gc2145, mode: &UvcMode, line_px: usize) -> RingGeometry {
+    let line_bytes = line_px * 2;
     let slot_bytes = mode.slot_rows * line_bytes;
     RingGeometry {
         slot_rows: mode.slot_rows,
@@ -1220,10 +1238,10 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                         // the previous chunk has gone out (about 1 ms), or returns at once when
                         // the host isn't streaming.
                         let mode = webcam.custom.unwrap_or(UVC_MODES[webcam.mode]);
-                        let ring = webcam_ring_geometry(&cam, &mode);
-                        let src_words = mode.line_px() * 2 / core::mem::size_of::<u32>();
+                        let ring = webcam_ring_geometry(&cam, &mode, webcam_line_px(&webcam, &mode));
+                        let src_words = webcam_line_px(&webcam, &mode) * 2 / core::mem::size_of::<u32>();
                         let dst_words = mode.width * 2 / core::mem::size_of::<u32>();
-                        let crop = webcam.crop_words.min(src_words - dst_words);
+                        let crop = webcam.crop_words.min(src_words.saturating_sub(dst_words));
                         loop {
                             let outstanding = webcam.xfer_queued - webcam.xfer_done;
                             if outstanding == 0 {
@@ -1600,9 +1618,11 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                         webcam.host_streaming = on;
                     }
                     let raw = if source == 2 {
-                        // console bring-up geometry: arg3 = w << 16 | h, arg4 = ratio << 8 | pad
+                        // console bring-up geometry: arg3 = w << 16 | h, arg4 = rowlen << 16 |
+                        // ratio << 8 | pad (rowlen 0: the camera DMA counts the padded width)
                         let (w, h) = (arg3 >> 16, arg3 & 0xffff);
-                        let (ratio, pad) = ((arg4 >> 8) as u16, arg4 & 0xff);
+                        let (ratio, pad) = (((arg4 >> 8) & 0xff) as u16, arg4 & 0xff);
+                        webcam.rowlen_override = arg4 >> 16;
                         let payload_rows = (4800 / (w * 2)).max(1);
                         let slot_rows = (UVC_CHUNK_PAYLOADS * payload_rows).min(h.max(payload_rows));
                         Some(UvcMode {
@@ -1617,7 +1637,15 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                     } else {
                         None
                     };
-                    let mode = if raw.is_some() { 0 } else { arg3.min(UVC_MODES.len() - 1) };
+                    // a bring-up geometry the size of a host mode counts as that mode, so a host
+                    // streaming that size keeps it instead of restarting the camera
+                    let mode = match raw {
+                        Some(m) => UVC_MODES
+                            .iter()
+                            .position(|u| u.width == m.width && u.height == m.height)
+                            .unwrap_or(0),
+                        None => arg3.min(UVC_MODES.len() - 1),
+                    };
                     if on {
                         if from_console {
                             webcam.pinned = true;

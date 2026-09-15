@@ -16,7 +16,7 @@ impl<'a> ShellCmdApi<'a> for Webcam {
     fn process(&mut self, args: String, env: &mut CommonEnv) -> Result<Option<String>, xous::Error> {
         use core::fmt::Write;
         let mut ret = String::new();
-        let helpstring = "webcam [on [mode]|off|status|preview off|on|zoom|auto|lock|exposure <ms> [pregain] [postgain]|flicker 50|60|wb auto|cal|<r> <g> <b>|tp <pattern>|rotate on|off|usbreset|crop <words>]\nmodes: 0 768x576, 1 384x288, 2 160x120";
+        let helpstring = "webcam [on [mode]|off|status|preview off|on|zoom|auto|lock|exposure <ms> [pregain] [postgain]|flicker 50|60|wb auto|cal|<r> <g> <b>|tp <pattern>|rotate on|off|usbreset|raw <w> <h> <ratio> [pad] [rowlen]|crop <words>]\nmodes: 0 768x576, 1 384x288, 2 160x120";
         let mut tokens = args.split_whitespace();
         let gfx = ux_api::service::gfx::Gfx::new(&env.xns).unwrap();
         match tokens.next() {
@@ -152,23 +152,26 @@ impl<'a> ShellCmdApi<'a> for Webcam {
             }
             Some("raw") => {
                 let parse = |s: Option<&str>| -> Option<usize> { s.and_then(|t| t.parse::<usize>().ok()) };
-                match (parse(tokens.next()), parse(tokens.next()), parse(tokens.next()), parse(tokens.next()))
-                {
-                    (Some(w), Some(h), Some(ratio), pad) => {
-                        match gfx.webcam_raw(w, h, ratio, pad.unwrap_or(24)) {
+                let (w, h, ratio) = (parse(tokens.next()), parse(tokens.next()), parse(tokens.next()));
+                let (pad, rowlen) = (parse(tokens.next()), parse(tokens.next()));
+                match (w, h, ratio) {
+                    (Some(w), Some(h), Some(ratio)) => {
+                        let (pad, rowlen) = (pad.unwrap_or(24), rowlen.unwrap_or(0));
+                        match gfx.webcam_raw(w, h, ratio, pad, rowlen) {
                             Ok(_) => write!(
                                 ret,
-                                "raw capture {}x{} ratio {} pad {}",
+                                "raw capture {}x{} ratio {} pad {} DMA row length {}",
                                 w,
                                 h,
                                 ratio,
-                                pad.unwrap_or(24)
+                                pad,
+                                if rowlen == 0 { w + pad } else { rowlen }
                             )
                             .ok(),
                             Err(e) => write!(ret, "error: {:?}", e).ok(),
                         }
                     }
-                    _ => write!(ret, "usage: webcam raw <w> <h> <ratio> [pad]").ok(),
+                    _ => write!(ret, "usage: webcam raw <w> <h> <ratio> [pad] [DMA row length]").ok(),
                 }
             }
             Some("flicker") => match tokens.next().and_then(|t| t.parse::<usize>().ok()) {

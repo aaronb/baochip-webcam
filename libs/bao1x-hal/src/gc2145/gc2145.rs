@@ -468,9 +468,12 @@ impl Gc2145 {
             self.mains_hz,
             level
         );
-        // NOTE: ratio 1 (no sub-sampling) does not produce a coherent image on this board: rows
-        // arrive misaligned with the line length whatever the crop, readout window, PLL or
-        // clock divider settings (measured 2026-09-09). Even ratios 2 and 4 are fine.
+        // NOTE: at ratio 1 (no sub-sampling) the sensor does not emit its crop width per line: a
+        // 778-sample crop gives 698 samples per line (measured 2026-09-15 with `set_row_length`:
+        // at 778 every row starts ~79 samples further along than the one above, at 698 the rows
+        // line up). The camera DMA splits lines by counting samples up to `REG_CAM_CFG_SIZE` (it
+        // does not resynchronise on HSYNC), so a row length equal to the crop width gives the
+        // incoherent frames seen on 2026-09-09. Ratios 2 and up emit the crop width.
         let dma_w = window_w as usize;
         self.dims = (dma_w, window_h as usize);
         self.slicing = None;
@@ -496,6 +499,14 @@ impl Gc2145 {
             | self.csr.ms(CFG_SOF_SYNC, 1)
             | self.csr.ms(CFG_SHIFT, 0);
         self.csr.wo(utra::udma_camera::REG_CAM_CFG_GLOB, global);
+    }
+
+    /// Set the camera DMA's row length on its own, after `init_window`. The DMA's column counter
+    /// wraps at this count and does not resynchronise on HSYNC (`camera_if.sv`), so a frame is
+    /// only coherent when it equals the samples the sensor emits per line. Bring-up only.
+    pub fn set_row_length(&mut self, len: usize) {
+        self.csr.wo(utra::udma_camera::REG_CAM_CFG_SIZE, (len.max(1) as u32 - 1) << 16);
+        self.dims.0 = len;
     }
 
     /// TODO: figure out how to length-bound this to...the frame slice size? line size? idk...
