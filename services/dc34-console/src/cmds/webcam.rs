@@ -16,7 +16,7 @@ impl<'a> ShellCmdApi<'a> for Webcam {
     fn process(&mut self, args: String, env: &mut CommonEnv) -> Result<Option<String>, xous::Error> {
         use core::fmt::Write;
         let mut ret = String::new();
-        let helpstring = "webcam [on [mode]|off|status|preview off|on|zoom|auto|lock|exposure <lines> [pregain] [postgain]|wb auto|cal|<r> <g> <b>|tp <pattern>|rotate on|off|usbreset]\nmodes: 0 768x576, 1 384x288, 2 160x120";
+        let helpstring = "webcam [on [mode]|off|status|preview off|on|zoom|auto|lock|exposure <lines> [pregain] [postgain]|flicker 50|60|wb auto|cal|<r> <g> <b>|tp <pattern>|rotate on|off|usbreset]\nmodes: 0 768x576, 1 384x288, 2 160x120";
         let mut tokens = args.split_whitespace();
         let gfx = ux_api::service::gfx::Gfx::new(&env.xns).unwrap();
         match tokens.next() {
@@ -170,6 +170,13 @@ impl<'a> ShellCmdApi<'a> for Webcam {
                     _ => write!(ret, "usage: webcam raw <w> <h> <ratio> [pad]").ok(),
                 }
             }
+            Some("flicker") => match tokens.next().and_then(|t| t.parse::<usize>().ok()) {
+                Some(hz) if hz == 50 || hz == 60 => match gfx.webcam_tune(9, hz, 0, 0) {
+                    Ok(_) => write!(ret, "anti-flicker step for {} Hz lighting", hz).ok(),
+                    Err(e) => write!(ret, "error: {:?}", e).ok(),
+                },
+                _ => write!(ret, "usage: webcam flicker 50|60").ok(),
+            },
             Some("clkdiv") => {
                 let v = tokens.next().and_then(|t| {
                     t.strip_prefix("0x")

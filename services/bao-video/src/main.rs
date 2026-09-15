@@ -409,6 +409,16 @@ fn webcam_start_capture(
     // image rows, the ring takes them as a chain of transfers (see `webcam_ring_start_frame`),
     // and the frame copy drops the 3 stale words at the start of every line.
     cam.init_window(i2c, mode.line_px() as u16, (mode.height + 1) as u16, mode.ratio);
+    log::info!(
+        "webcam: {}x{} 1/{}: row {} ns, frame {} rows ({} us), anti-flicker for {} Hz",
+        mode.width,
+        mode.height,
+        mode.ratio,
+        cam.row_ns(),
+        cam.frame_rows(),
+        cam.frame_us(),
+        cam.mains_hz()
+    );
     tt.sleep_ms(15).ok();
     webcam_apply_rotation(cam, i2c, webcam.rotate);
     if mode.ratio == 1 {
@@ -1767,6 +1777,23 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                     .redraw()
                                     .unwrap_or_else(|_| display_timeout_handler(&udma_global, &mut display));
                             }
+                        }
+                        if let Some(scalar) = msg.body.scalar_message_mut() {
+                            scalar.arg1 = 1;
+                        }
+                        continue;
+                    }
+                    if a1 == 9 {
+                        // mains frequency the AEC's anti-flicker step is derived from
+                        cam.set_mains_hz(a2 as u32);
+                        if webcam.active {
+                            let (step, level) = cam.apply_anti_flicker(&mut i2c);
+                            log::info!(
+                                "webcam: anti-flicker for {} Hz: step {} rows, AEC ceiling {} rows",
+                                cam.mains_hz(),
+                                step,
+                                level
+                            );
                         }
                         if let Some(scalar) = msg.body.scalar_message_mut() {
                             scalar.arg1 = 1;

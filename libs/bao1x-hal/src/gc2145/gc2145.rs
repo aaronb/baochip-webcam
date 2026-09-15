@@ -20,6 +20,17 @@ pub const CFG_SHIFT: utralib::Field = utralib::Field::new(4, 11, REG_CAM_CFG_GLO
 pub const CFG_SOF_SYNC: utralib::Field = utralib::Field::new(1, 30, REG_CAM_CFG_GLOB);
 pub const CFG_GLOB_EN: utralib::Field = utralib::Field::new(1, 31, REG_CAM_CFG_GLOB);
 
+/// Rate of the sensor's timing unit. The datasheet (7.1.1) gives the row time as
+/// `Hb + Sh_delay + win_width + 4` and the frame as `VB + win_height` rows, in units of the
+/// readout clock, but not that clock's rate, which follows from the PLL and divider settings
+/// (P0:0xf7 = 0x1d and 0xf8 = 0x85 from the init table, 0xfa = 0x19 from `set_resolution`).
+/// Measured 2026-09-15: the 768x576 webcam mode (1889-unit rows, 1212-row frames) ran at
+/// 12.04 fps with the exposure well inside the frame.
+pub const TIMING_UNITS_PER_SECOND: u64 = 27_565_000;
+
+/// Mains frequency the AEC's anti-flicker step is derived from until `set_mains_hz` says otherwise
+pub const DEFAULT_MAINS_HZ: u32 = 60;
+
 /// Exposure and white-balance state of the GC2145 (page 0 registers 0x03/0x04, 0xb1..0xb6, 0x82).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Gc2145Exposure {
@@ -42,6 +53,12 @@ pub struct Gc2145 {
     /// output size the sensor was configured for (before slicing)
     dims: (usize, usize),
     slicing: Option<(usize, usize)>,
+    /// row duration of the configured readout window, in sensor timing units
+    row_units: u32,
+    /// frame length of the configured readout window, in rows
+    frame_rows: u32,
+    /// mains frequency the AEC's anti-flicker step is derived from
+    mains_hz: u32,
 }
 
 impl Udma for Gc2145 {
@@ -95,6 +112,10 @@ impl Gc2145 {
             resolution: Resolution::Res160x120,
             dims: (160, 120),
             slicing: None,
+            // the 768x576 webcam window's timing, until a window is configured
+            row_units: 1889,
+            frame_rows: 1212,
+            mains_hz: DEFAULT_MAINS_HZ,
         }
     }
 
@@ -159,6 +180,67 @@ impl Gc2145 {
         self.peek(i2c, 0x82, &mut b);
         self.poke(i2c, 0x82, if on { b[0] | 0x02 } else { b[0] & !0x02 });
     }
+
+    /// Duration of one row of the configured readout window, in nanoseconds.
+    pub fn row_ns(&self) -> u64 {
+        (self.row_units.max(1) as u64 * 1_000_000_000 / TIMING_UNITS_PER_SECOND).max(1)
+    }
+
+    /// Frame time of the configured readout window while the exposure fits inside the frame
+    /// (a longer exposure stretches the frame), in microseconds.
+    pub fn frame_us(&self) -> u32 { (self.frame_rows as u64 * self.row_ns() / 1000) as u32 }
+
+    /// Set the mains frequency (50 or 60 Hz; anything else is taken as 60) the AEC's anti-flicker
+    /// step is derived from. Takes effect at the next `init_window`, or at once through
+    /// `apply_anti_flicker`.
+    pub fn set_mains_hz(&mut self, hz: u32) { self.mains_hz = if hz == 50 { 50 } else { 60 }; }
+
+    pub fn mains_hz(&self) -> u32 { self.mains_hz }
+
+    /// Program the AEC's anti-flicker step (P1:0x25/0x26) and exposure levels 1-4
+    /// (P1:0x27..0x2e) for the configured readout window, as the Linux driver does per mode.
+    /// Both are in rows, so they follow the row time: the step is the lighting's flicker period
+    /// (half the mains period), and the levels cap the AEC at the whole steps that fit in a
+    /// frame, so the engine avoids banding and never stretches the frame. Returns (step, level)
+    /// in rows.
+    pub fn apply_anti_flicker(&self, i2c: &mut dyn I2cApi) -> (u16, u16) {
+        let ns = self.row_ns();
+        let flicker_ns = 1_000_000_000u64 / (2 * self.mains_hz as u64);
+        let step = ((flicker_ns + ns / 2) / ns).clamp(1, 0x1fff) as u16;
+        let level = ((self.frame_rows / step as u32).max(1) * step as u32).min(0x1fff) as u16;
+        // page 1
+        self.poke(i2c, GC2145_REG_RESET, 0x01);
+        self.poke(i2c, 0x25, (step >> 8) as u8);
+        self.poke(i2c, 0x26, step as u8);
+        for reg in [0x27u8, 0x29, 0x2b, 0x2d] {
+            self.poke(i2c, reg, (level >> 8) as u8);
+            self.poke(i2c, reg + 1, level as u8);
+        }
+        self.poke(i2c, GC2145_REG_RESET, GC2145_SET_P0_REGS);
+        (step, level)
+    }
+
+    /// Timing of the readout window `set_resolution` wrote (datasheet 7.1.1): row time
+    /// `Hb + Sh_delay + win_width + 4` in timing units, and frame length `VB + win_height` in
+    /// rows (`Vt + 8` with `Vt = win_height - 8`). The blanking registers are read back; the
+    /// window size is not, because its registers still read the init table's window right
+    /// after a write (measured: every mode read 1618x1216).
+    fn set_timing(&mut self, i2c: &mut dyn I2cApi, readout: (u16, u16)) {
+        self.poke(i2c, GC2145_REG_RESET, GC2145_SET_P0_REGS);
+        let mut b = [0u8; 2];
+        let mut rd = |adr: u8, high_bits: u8| {
+            self.peek(i2c, adr, &mut b);
+            ((b[0] & high_bits) as u32) << 8 | b[1] as u32
+        };
+        let hb = rd(0x05, 0x0f);
+        let vb = rd(0x07, 0x1f);
+        let sh_delay = rd(0x11, 0x03);
+        self.row_units = hb + sh_delay + readout.0 as u32 + 4;
+        self.frame_rows = vb + readout.1 as u32;
+    }
+
+    /// Frame length of the configured readout window in rows, while the exposure fits inside it.
+    pub fn frame_rows(&self) -> u32 { self.frame_rows }
 
     pub fn release_ifram(&mut self) {
         if let Some(ifram) = self.ifram.take() {
@@ -239,7 +321,8 @@ impl Gc2145 {
         self.poke(i2c, reg, (w & 0xff) as u8);
     }
 
-    fn set_resolution(&self, i2c: &mut dyn I2cApi, w: u16, h: u16, ratio: u16) {
+    /// Returns the readout window size written (P0:0x0d..0x10).
+    fn set_resolution(&self, i2c: &mut dyn I2cApi, w: u16, h: u16, ratio: u16) -> (u16, u16) {
         // these define the scaling of the image. If "digital zoom" is required, decrease
         // these numbers to get a higher magnification.
         let c_ratio = ratio;
@@ -281,6 +364,7 @@ impl Gc2145 {
         // faster clock enables a faster frame rate
         // now at 35Hz frame rate
         self.poke(i2c, 0xFA, 0x19);
+        (win_w + 16, win_h + 8)
     }
 
     #[inline(never)]
@@ -308,7 +392,8 @@ impl Gc2145 {
     /// Reset and configure the sensor to output a `window_w` x `window_h` image, produced by
     /// reading a centred `window_w * ratio` x `window_h * ratio` region of the sensor and
     /// sub-sampling it by `ratio` (even values only). Also configures the camera DMA for that
-    /// line length. `resolution()` reports `window_w` x `window_h` until slicing is set.
+    /// line length and the AEC's anti-flicker step for the window's row time. `resolution()`
+    /// reports `window_w` x `window_h` until slicing is set.
     #[inline(never)]
     pub fn init_window(&mut self, i2c: &mut dyn I2cApi, window_w: u16, window_h: u16, ratio: u16) {
         // initiate a reset
@@ -339,7 +424,17 @@ impl Gc2145 {
         self.delay(30);
 
         crate::println!("camera window {}x{} (subsample 1/{})", window_w, window_h, ratio);
-        self.set_resolution(i2c, window_w, window_h, ratio);
+        let readout = self.set_resolution(i2c, window_w, window_h, ratio);
+        self.set_timing(i2c, readout);
+        let (step, level) = self.apply_anti_flicker(i2c);
+        crate::println!(
+            "row {} ns, frame {} rows, anti-flicker step {} rows at {} Hz, AEC ceiling {} rows",
+            self.row_ns(),
+            self.frame_rows,
+            step,
+            self.mains_hz,
+            level
+        );
         // NOTE: ratio 1 (no sub-sampling) does not produce a coherent image on this board: rows
         // arrive misaligned with the line length whatever the crop, readout window, PLL or
         // clock divider settings (measured 2026-09-09). Even ratios 2 and 4 are fine.

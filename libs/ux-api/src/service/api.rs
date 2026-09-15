@@ -141,7 +141,8 @@ pub enum GfxOpcode {
     /// for the sensor's own engine, 2 for a one-shot grey-world calibration that ends in manual
     /// gains; 6 = preview, arg2 = 0 off, 1 full frame, 2 centre crop; 8 = rotate the picture a
     /// half turn, arg2 = 0 upright, 1 rotated (the sensor's readout direction, so the preview
-    /// and the USB stream both turn); 4 and 5 are tuning knobs.
+    /// and the USB stream both turn); 9 = mains frequency the AEC's anti-flicker step is
+    /// derived from, arg2 = 50 or 60; 4 and 5 are tuning knobs.
     /// Settings persist across capture sessions. Reply arg1 = 1 on success.
     #[cfg(feature = "board-baosec")]
     WebcamExposure,

@@ -878,7 +878,9 @@ impl Gfx {
     }
 
     /// Tuning knobs: `webcam_tune(4, div, 0, 0)` sets the sensor clock divider used for
-    /// full-resolution modes; `webcam_tune(5, page, reg, val)` pokes a sensor register.
+    /// full-resolution modes; `webcam_tune(5, page, reg, val)` pokes a sensor register;
+    /// `webcam_tune(9, hz, 0, 0)` sets the mains frequency (50 or 60) the AEC's anti-flicker
+    /// step is derived from.
     #[cfg(feature = "board-baosec")]
     pub fn webcam_tune(&self, what: usize, a: usize, b: usize, c: usize) -> Result<(), xous::Error> {
         match send_message(
