@@ -986,6 +986,22 @@ pub(crate) fn main_hw() -> ! {
                     xous::try_send_message(cid, xous::Message::new_scalar(op, state, 0, mode, 0)).ok();
                 }
             }),
+            Opcode::UsbBusReset => {
+                log::warn!("USB bus reset requested");
+                #[cfg(feature = "uvc")]
+                {
+                    if let Some(mut env) = uvc_pending.take() {
+                        if let Some(mem) = env.body.memory_message_mut() {
+                            mem.valid = xous::MemorySize::new(UVC_RESULT_NOT_STREAMING);
+                        }
+                    }
+                    cu.uvc.reset_state();
+                    if let Some((cid, op)) = uvc_observer {
+                        xous::try_send_message(cid, xous::Message::new_scalar(op, 0, 0, 0, 0)).ok();
+                    }
+                }
+                usb_device::bus::UsbBus::force_reset(cu.device.bus()).ok();
+            }
             Opcode::UvcStatus => {
                 if let Some(scalar) = msg.body.scalar_message_mut() {
                     #[cfg(feature = "uvc")]

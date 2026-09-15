@@ -87,6 +87,10 @@ pub enum Opcode {
     RegisterUvcObserver = 1101,
     /// Query UVC stream state: returns (streaming, frames_sent)
     UvcStatus = 1102,
+    /// Drop off the bus and re-enumerate: the device core is reset and restarted, so the host
+    /// sees an unplug and a fresh plug-in. A recovery action for a wedged link; it also
+    /// restarts the USB serial console. Blocking scalar, replies once the core is back up.
+    UsbBusReset = 1103,
 
     #[cfg(feature = "mass-storage")]
     SetBlockDevice = 1024,

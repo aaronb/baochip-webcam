@@ -400,6 +400,16 @@ impl UsbHid {
         }
     }
 
+    /// Drop off the bus and re-enumerate (see `Opcode::UsbBusReset`). The serial console goes
+    /// away with the link, so a reply may never reach a caller on that console.
+    pub fn bus_reset(&self) -> Result<(), xous::Error> {
+        send_message(
+            self.conn,
+            Message::new_blocking_scalar(Opcode::UsbBusReset.to_usize().unwrap(), 0, 0, 0, 0),
+        )
+        .map(|_| ())
+    }
+
     /// Sets the userland application HID device descriptor.
     /// It cannot be longer than 1024 bytes.
     pub fn connect_hid_app(&self, descriptor: Vec<u8>) -> Result<(), xous::Error> {
