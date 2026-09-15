@@ -306,17 +306,18 @@ impl UvcMode {
     pub const fn transfers(&self) -> usize { (self.height + self.slot_rows - 1) / self.slot_rows }
 }
 
-/// The modes, in UVC frame-descriptor order (bFrameIndex = index + 1). Index 0 is the default.
+/// The modes, in UVC frame-descriptor order (bFrameIndex = index + 1). Index 0 is the default
+/// frame, which is what hosts open unless told otherwise, so the largest picture comes first.
 pub const UVC_MODES: [UvcMode; 3] = [
-    // 640x480 sensor window (the QR scanner's), 1/4: the low-latency mode, sensor ~37 fps
+    // 1556x1154 window, 1/2, sensor ~11 fps
     UvcMode {
-        width: 160,
-        height: 120,
-        ratio: 4,
-        line_pad: 24,
-        interval: 333_333,
-        payload_rows: 15,
-        slot_rows: 60,
+        width: 768,
+        height: 576,
+        ratio: 2,
+        line_pad: 10,
+        interval: 833_333,
+        payload_rows: 3,
+        slot_rows: 24,
     },
     // 1568x1152 window, 1/4: nearly the full field of view, sensor ~11 fps
     UvcMode {
@@ -328,15 +329,15 @@ pub const UVC_MODES: [UvcMode; 3] = [
         payload_rows: 6,
         slot_rows: 48,
     },
-    // 1556x1154 window, 1/2, sensor ~11 fps
+    // 640x480 sensor window (the QR scanner's), 1/4: the low-latency mode, sensor ~37 fps
     UvcMode {
-        width: 768,
-        height: 576,
-        ratio: 2,
-        line_pad: 10,
-        interval: 833_333,
-        payload_rows: 3,
-        slot_rows: 24,
+        width: 160,
+        height: 120,
+        ratio: 4,
+        line_pad: 24,
+        interval: 333_333,
+        payload_rows: 15,
+        slot_rows: 60,
     },
     // A full-resolution (ratio 1) mode is deliberately absent: the sensor's ratio-1 output is
     // not coherent through this camera DMA (see the note in Gc2145::init_window).
