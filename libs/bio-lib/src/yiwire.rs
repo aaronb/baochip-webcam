@@ -6,7 +6,6 @@ use bao1x_api::{IoSetup, IoxDir, IoxEnable};
 use bao1x_hal::bio::{Bio, CoreCsr};
 use utralib::utra::bio_bdma;
 
-
 // Send a reset on the bus
 static CMD_RESET: u32 = 0;
 // Write a byte on the bus
@@ -40,7 +39,6 @@ static YW_READ_SCRATCHPAD: u32 = 0xBE;
 // Search ROM: Find addresses of all connected devices,
 // one by one
 static YW_SEARCH_ROM: u32 = 0xF0;
-
 
 pub struct YiWire {
     bio_ss: Bio,
@@ -112,7 +110,7 @@ impl YiWire {
         let rx_handle = unsafe { bio_ss.get_core_handle(Fifo::Fifo3) }?.expect("Didn't get FIFO3 handle");
 
         let mut tx = CoreCsr::from_handle(&tx_handle);
-        let rx =  CoreCsr::from_handle(&rx_handle);
+        let rx = CoreCsr::from_handle(&rx_handle);
         tx.csr.wo(bio_bdma::SFR_TXF2, io_config.mapped);
 
         Ok(Self {
@@ -137,7 +135,7 @@ impl YiWire {
                 let mut bitmask = [false; 64];
                 let mut addr = [0u8; 8];
                 self.cmd(CMD_WRITE, YW_SEARCH_ROM);
-                for bit in 0 .. 64 {
+                for bit in 0..64 {
                     let res = self.cmd(CMD_READ, 0x02);
                     let id_bit = (res & 0x01) != 0;
                     let cmp_bit = (res & 0x02) != 0;
@@ -148,23 +146,20 @@ impl YiWire {
                     }
                     if id_bit != cmp_bit {
                         bitmask[bit] = id_bit;
-                        addr[bit >> 3] |= (if id_bit {1} else {0}) << (bit & 0x07);
+                        addr[bit >> 3] |= (if id_bit { 1 } else { 0 }) << (bit & 0x07);
                         self.cmd(CMD_WRITE_BIT, if id_bit { 1 } else { 0 });
                     } else {
-                        let id_bit = if bit < discrepancy_at {
-                            last_bitmask[bit]
-                        } else {
-                            bit == discrepancy_at
-                        };
+                        let id_bit =
+                            if bit < discrepancy_at { last_bitmask[bit] } else { bit == discrepancy_at };
                         bitmask[bit] = id_bit;
-                        addr[bit >> 3] |= (if id_bit {1} else {0}) << (bit & 0x07);
+                        addr[bit >> 3] |= (if id_bit { 1 } else { 0 }) << (bit & 0x07);
                         self.cmd(CMD_WRITE_BIT, if id_bit { 1 } else { 0 });
                         if !id_bit {
                             discrepancy_at = bit;
                         }
                     }
                 }
-                if last_bitmask == bitmask{
+                if last_bitmask == bitmask {
                     // Found all devices
                     break;
                 }
@@ -173,7 +168,9 @@ impl YiWire {
                 if computed_crc == transmitted_crc {
                     addrs.push(addr);
                 } else {
-                    log::warn!("Received device address with incorrect CRC got {computed_crc}, expected {transmitted_crc}");
+                    log::warn!(
+                        "Received device address with incorrect CRC got {computed_crc}, expected {transmitted_crc}"
+                    );
                 }
                 last_bitmask = bitmask;
             }
@@ -211,14 +208,16 @@ impl YiWire {
             let b2 = self.cmd(CMD_READ, 0x20);
             let transmitted_crc = self.cmd(CMD_READ, 0x08) as u8;
             // This array is built so a CRC can be computed
-            let arry = [  (b1 & 0xFF) as u8,
-                             ((b1 >> 8) & 0xFF) as u8,
-                             ((b1 >> 16) & 0xFF) as u8,
-                             ((b1 >> 24) & 0xFF) as u8,
-                              (b2 & 0xFF) as u8,
-                             ((b2 >> 8) & 0xFF) as u8,
-                             ((b2 >> 16) & 0xFF) as u8,
-                             ((b2 >> 24) & 0xFF) as u8 ];
+            let arry = [
+                (b1 & 0xFF) as u8,
+                ((b1 >> 8) & 0xFF) as u8,
+                ((b1 >> 16) & 0xFF) as u8,
+                ((b1 >> 24) & 0xFF) as u8,
+                (b2 & 0xFF) as u8,
+                ((b2 >> 8) & 0xFF) as u8,
+                ((b2 >> 16) & 0xFF) as u8,
+                ((b2 >> 24) & 0xFF) as u8,
+            ];
             let computed_crc = crc8(&arry);
 
             if transmitted_crc == computed_crc {
@@ -241,7 +240,6 @@ impl YiWire {
     }
 }
 
-
 // helpers
 fn crc8(data: &[u8]) -> u8 {
     let mut crc: u8 = 0x00;
@@ -259,8 +257,6 @@ fn crc8(data: &[u8]) -> u8 {
     }
     crc
 }
-
-
 
 // yiwire -- ws2812, adapted
 //
@@ -446,4 +442,3 @@ bio_code!(yiwire_kernel, YIWIRE_START, YIWIRE_END,
     "jalr x0, x6, 0"        // return
 
 );
-
