@@ -278,7 +278,8 @@ impl TryFrom<usize> for LogLevel {
 pub struct UvcMode {
     pub width: usize,
     pub height: usize,
-    /// sensor sub-sampling ratio; only even values are clean on the GC2145
+    /// sensor sub-sampling ratio: even, or odd up to 7 (read in groups of twice the ratio,
+    /// keeping one Bayer quad of each; see `Gc2145::set_resolution`); 1 is not coherent
     pub ratio: u16,
     /// extra columns captured per line
     pub line_pad: usize,

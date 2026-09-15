@@ -352,8 +352,15 @@ impl Gc2145 {
         let win_x = ((UXGA_HSIZE - win_w) / 2) & !1;
         let win_y = ((UXGA_VSIZE - win_h) / 2) & !1;
 
+        // The readout window also has an even number of rows (and columns; the width's bit 0 is
+        // not implemented): with the vertical flip the webcam uses for an upright picture the
+        // readout starts at the window's last row, so an odd height shifts the colour filter
+        // phase the same way an odd start row does.
+        let read_w = (win_w + 16 + 1) & !1;
+        let read_h = (win_h + 8 + 1) & !1;
+
         /* Set readout window first. */
-        self.gc2145_set_window(i2c, GC2145_REG_BLANK_WINDOW_BASE, win_x, win_y, win_w + 16, win_h + 8);
+        self.gc2145_set_window(i2c, GC2145_REG_BLANK_WINDOW_BASE, win_x, win_y, read_w, read_h);
 
         /* Set cropping window next. */
         self.gc2145_set_window(i2c, GC2145_REG_WINDOW_BASE, x, y, w, h);
@@ -361,21 +368,36 @@ impl Gc2145 {
         /* Enable crop */
         self.poke(i2c, GC2145_REG_CROP_ENABLE, GC2145_CROP_SET_ENABLE);
 
-        /* Set Sub-sampling ratio and mode */
-        self.poke(i2c, GC2145_REG_SUBSAMPLE, ((r_ratio << 4) | c_ratio) as u8);
-
-        // Sub-sample mode: nearest-neighbour averaging plus "use" mode for real sub-sampling.
-        // At ratio 1 that mode produces no frames at all (measured); the "smooth" mode the init
-        // table starts from works there.
-        let mode = if ratio == 1 { GC2145_SUBSAMPLE_MODE_SMOOTH } else { 0x32 };
+        // Sub-sampling. P0:0x99 is the group size ([7:4] rows, [3:0] columns). In "use" mode
+        // (P0:0x9a [5:4] set) the sensor combines each group, which keeps the Bayer phase only
+        // for even groups; in "cut" mode it keeps the rows and columns listed in P0:0x9b..0x9e
+        // and 0x9f..0xa2 (sub row/col num 1..8, a nibble each). An odd ratio r therefore reads
+        // groups of 2r and keeps one Bayer quad, indices 0 and 1, of each (so r is at most 7).
+        // Measured 2026-09-15 at 768x576: group 4 keeping {0, 1} in cut mode gives the same
+        // picture as group 2 in use mode; group 3 keeping {0, 1} scales by 2/3 with correct
+        // colour; group 3 in use mode ignores the list.
+        let (group, keep, mode) = match ratio {
+            // "smooth" mode: nearest-neighbour averaging plus "use" mode produces no frames at
+            // ratio 1 (measured)
+            1 => (1, 0x00, GC2145_SUBSAMPLE_MODE_SMOOTH),
+            // nearest-neighbour averaging plus "use" mode
+            r if r % 2 == 0 => (r, 0x00, 0x32),
+            // "cut" mode with smoothed chroma and neighbour averaging, as the Linux driver's
+            // 640x480 mode
+            r => (2 * r, 0x01, 0x06),
+        };
+        for reg in 0x9bu8..=0xa2 {
+            self.poke(i2c, reg, if reg == 0x9b || reg == 0x9f { keep } else { 0x00 });
+        }
         self.poke(i2c, GC2145_REG_SUBSAMPLE_MODE, mode);
+        self.poke(i2c, GC2145_REG_SUBSAMPLE, ((group << 4) | group) as u8);
 
         self.delay(30);
 
         // faster clock enables a faster frame rate
         // now at 35Hz frame rate
         self.poke(i2c, 0xFA, 0x19);
-        (win_w + 16, win_h + 8)
+        (read_w, read_h)
     }
 
     #[inline(never)]
@@ -383,7 +405,6 @@ impl Gc2145 {
         let (w, h) = resolution.into();
         // Sub-sampling ratio: 320x240 reads a 640x480 window at 1/2. 160x120 keeps the same
         // 640x480 window (same field of view) at 1/4 rather than zooming in on a 320x240 window.
-        // Only even ratios are clean on this sensor (odd ones scramble the Bayer phase).
         let ratio = match resolution {
             Resolution::Res160x120 => 4u16,
             _ => 2u16,
@@ -402,9 +423,9 @@ impl Gc2145 {
 
     /// Reset and configure the sensor to output a `window_w` x `window_h` image, produced by
     /// reading a centred `window_w * ratio` x `window_h * ratio` region of the sensor and
-    /// sub-sampling it by `ratio` (even values only). Also configures the camera DMA for that
-    /// line length and the AEC's anti-flicker step for the window's row time. `resolution()`
-    /// reports `window_w` x `window_h` until slicing is set.
+    /// sub-sampling it by `ratio` (even ratios, or odd ones up to 7; see `set_resolution`).
+    /// Also configures the camera DMA for that line length and the AEC's anti-flicker step for
+    /// the window's row time. `resolution()` reports `window_w` x `window_h` until slicing is set.
     #[inline(never)]
     pub fn init_window(&mut self, i2c: &mut dyn I2cApi, window_w: u16, window_h: u16, ratio: u16) {
         // initiate a reset
