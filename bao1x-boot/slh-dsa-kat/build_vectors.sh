@@ -30,6 +30,10 @@ echo "== installing SP 800-230 params + KAT driver into $REF =="
 cp "$HERE"/params/params-sphincs-*-24.h "$REF/params/"
 cp "$HERE"/slh_kat.c "$HERE"/slh_validate.c "$REF/"
 
+# Upstream base_w() is only correct when lg_w divides 8; the 192-24 sets use 3.
+echo "== patching ref/wots.c: base_w -> FIPS-205 base_2b (needed for lg_w = 3) =="
+git -C "$WORK" apply "$HERE/base_2b.patch"
+
 cd "$REF"
 CC=${CC:-gcc}
 CFLAGS="-O3 -std=c99 -Wall -march=native"
