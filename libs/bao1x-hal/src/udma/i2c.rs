@@ -9,6 +9,8 @@ use crate::udma::{Bank, Udma};
 const TIMEOUT_ITERS: usize = 1_000_000;
 #[cfg(feature = "hdl-test")]
 const TIMEOUT_ITERS: usize = 5000;
+/// How long `wait_for_start` looks for a queued transaction to get going, in polls
+const START_POLLS: usize = 100_000;
 
 // MPW had this register:
 //        pub const REG_SETUP: crate::Register = crate::Register::new(13, 0x1);
@@ -380,6 +382,28 @@ impl<'a> I2cDriver<'a> {
             || self.udma_busy(Bank::Rx)
     }
 
+    /// Give a queued transaction a bounded number of polls to get going.
+    ///
+    /// This used to spin until it saw BUSY set with the command queue drained. That only holds
+    /// from the controller taking the last command (the stop) until the stop completes, so a
+    /// thread preempted across that moment spun forever, and with it every client of the I2C
+    /// server (the camera, the accelerometer). `i2c_await` waits for the transaction to finish
+    /// either way.
+    fn wait_for_start(&self) {
+        for _ in 0..START_POLLS {
+            #[cfg(not(feature = "mpw"))]
+            if self.csr.rf(utra::udma_i2c_0::REG_STATUS_R_BUSY) != 0
+                && self.csr.rf(utra::udma_i2c_0::REG_CMD_SIZE_R_CMD_SIZE) == 0
+            {
+                return;
+            }
+            #[cfg(feature = "mpw")]
+            if self.csr.rf(utra::udma_i2c_0::REG_STATUS_R_BUSY) != 0 {
+                return;
+            }
+        }
+    }
+
     /// Basically, does a read from an I2C address without specifying a register. The protocol
     /// would not make sense for any real-world application, but it is an MVP than exercises
     /// both a write (to specify the device address) and a read (the response data) form of
@@ -429,13 +453,7 @@ impl<'a> I2cDriver<'a> {
             self.udma_enqueue(Bank::Tx, &self.tx_buf_phys[..data.len()], CFG_EN);
             self.udma_enqueue(Bank::Custom, &self.cmd_buf_phys[..self.seq_len], CFG_EN);
         }
-        // wait for the commands to propagate before returning
-        #[cfg(not(feature = "mpw"))]
-        while self.csr.rf(utra::udma_i2c_0::REG_STATUS_R_BUSY) == 0
-            || self.csr.rf(utra::udma_i2c_0::REG_CMD_SIZE_R_CMD_SIZE) != 0
-        {}
-        #[cfg(feature = "mpw")]
-        while self.csr.rf(utra::udma_i2c_0::REG_STATUS_R_BUSY) == 0 {}
+        self.wait_for_start();
         self.pending = I2cPending::Write(data.len());
         Ok(data.len())
     }
@@ -494,13 +512,7 @@ impl<'a> I2cDriver<'a> {
             self.udma_enqueue(Bank::Rx, &self.rx_buf_phys[..len], CFG_EN);
             self.udma_enqueue(Bank::Custom, &self.cmd_buf_phys[..self.seq_len], CFG_EN);
         }
-        // wait for the commands to propagate before returning
-        #[cfg(not(feature = "mpw"))]
-        while self.csr.rf(utra::udma_i2c_0::REG_STATUS_R_BUSY) == 0
-            || self.csr.rf(utra::udma_i2c_0::REG_CMD_SIZE_R_CMD_SIZE) != 0
-        {}
-        #[cfg(feature = "mpw")]
-        while self.csr.rf(utra::udma_i2c_0::REG_STATUS_R_BUSY) == 0 {}
+        self.wait_for_start();
         self.pending = I2cPending::Read(len);
         Ok(len)
     }
