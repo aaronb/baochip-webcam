@@ -197,6 +197,17 @@ impl Keyboard {
         }
     }
 
+    /// Like `inject_key`, but fails instead of waiting when the keyboard server's queue is full.
+    /// For callers the keyboard server can end up waiting on (through the log server, for one),
+    /// where waiting deadlocks.
+    pub fn try_inject_key(&self, c: char) -> Result<(), xous::Error> {
+        xous::try_send_message(
+            self.conn,
+            Message::new_scalar(KeyboardOpcode::InjectKey.to_usize().unwrap(), c as u32 as usize, 0, 0, 0),
+        )
+        .map(|_| ())
+    }
+
     pub fn inject_key(&self, c: char) {
         send_message(
             self.conn,

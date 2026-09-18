@@ -31,15 +31,30 @@ pub struct UsbString {
     pub sent: Option<u32>,
 }
 
+/// Mirror a line to the USB serial console without ever waiting for the USB service. Its main
+/// loop logs too: a log server waiting here on that loop's full queue while the loop waits on the
+/// log server deadlocks both, and then every process that logs. A line that doesn't fit is
+/// counted in `dropped` (the UART still gets it) and the count is reported once there is room.
 #[cfg(feature = "usb")]
-fn usb_send_str(conn: xous::CID, s: &str) {
+fn usb_send_str(conn: xous::CID, s: &str, dropped: &mut u32) {
+    if *dropped > 0 {
+        if !usb_try_send(conn, &format!("LOG: {} lines not mirrored to USB\r\n", dropped)) {
+            *dropped += 1;
+            return;
+        }
+        *dropped = 0;
+    }
+    if !usb_try_send(conn, s) {
+        *dropped += 1;
+    }
+}
+
+#[cfg(feature = "usb")]
+fn usb_try_send(conn: xous::CID, s: &str) -> bool {
     let serializer = UsbString { s: String::from(s), sent: None };
     match xous_ipc::Buffer::into_buf(serializer) {
-        Ok(buf) => {
-            // failures to send are silent & ignored; also, this API doesn't block.
-            buf.send(conn, 8192 /* LogString */).ok();
-        }
-        _ => {} // dont block on errors
+        Ok(buf) => buf.try_send(conn, 8192 /* LogString */).is_ok(),
+        _ => false,
     }
 }
 
@@ -53,6 +68,8 @@ fn reader_thread(arg: usize) {
     // use a stack-allocated string to ensure no heap thrashing results from String manipulations
     #[cfg(feature = "usb")]
     let mut usb_str = String::new();
+    #[cfg(feature = "usb")]
+    let mut usb_dropped = 0u32;
 
     println!("LOG: my PID is {}", xous::process::id());
     let mut counter: usize = 0;
@@ -142,7 +159,7 @@ fn reader_thread(arg: usize) {
                                 write!(usb_str, ":{}", line.get()).ok();
                             }
                             writeln!(usb_str, ")\r").ok();
-                            usb_send_str(conn, &usb_str);
+                            usb_send_str(conn, &usb_str, &mut usb_dropped);
                         }
                     }
                     api::Opcode::StandardOutput | api::Opcode::StandardError => {
@@ -181,7 +198,7 @@ fn reader_thread(arg: usize) {
                             // so it's not very safe. On the other hand, it's fast and shame on you for
                             // sending non-utf8 to this API.
                             let s = unsafe { std::str::from_utf8_unchecked(buffer) }.to_string();
-                            usb_send_str(conn, &s.replace("\n", "\r\n"));
+                            usb_send_str(conn, &s.replace("\n", "\r\n"), &mut usb_dropped);
                         }
                     }
                     _ => {
@@ -196,7 +213,7 @@ fn reader_thread(arg: usize) {
                         writeln!(output, "PANIC in PID {}:", sender_pid).unwrap();
                         #[cfg(feature="usb")]
                         if let Some(conn) = usb_serial {
-                            usb_send_str(conn, &format!("PANIC in PID {}:", sender_pid));
+                            usb_send_str(conn, &format!("PANIC in PID {}:", sender_pid), &mut usb_dropped);
                         }
                     },
                     1100 => (),
@@ -231,14 +248,14 @@ fn reader_thread(arg: usize) {
                         // doing that, we really don't have any mechanism to handle that since this is the panic handler.
                         // Erring on the side of simplicity/"get any message out" versus correctness for this API.
                         if let Some(conn) = usb_serial {
-                            usb_send_str(conn, unsafe{std::str::from_utf8_unchecked(&output_bfr[..total_chars])});
+                            usb_send_str(conn, unsafe{std::str::from_utf8_unchecked(&output_bfr[..total_chars])}, &mut usb_dropped);
                         }
                     }
                     1200 => {
                         writeln!(output, "Terminating process").unwrap();
                         #[cfg(feature="usb")]
                         if let Some(conn) = usb_serial {
-                            usb_send_str(conn, "Terminating process");
+                            usb_send_str(conn, "Terminating process", &mut usb_dropped);
                         }
                     },
                     2000 => {

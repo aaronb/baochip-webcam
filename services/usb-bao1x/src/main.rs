@@ -358,14 +358,13 @@ pub(crate) fn main_hw() -> ! {
             );
         }
         if cu.double_lock_detected() {
+            // UVC builds count it for `uvc_debug.py` rather than log from whatever message it
+            // shows up on, which is often a burst of mirrored log lines
             #[cfg(feature = "uvc")]
             dbg.double_locks.fetch_add(1, Ordering::SeqCst);
-            phase!(
-                dbg,
-                crate::uvc::PHASE_LOG,
-                log::warn!(
-                    "Double lock error detected in USB stack. Meditations: services/usb-bao1x/src/hw.rs@226 (composite_handler inner loop) and consider adding more IRQ enable/disable similar to libs/bao1x-hal/src/usb/driver.rs@2549 (write impl)"
-                )
+            #[cfg(not(feature = "uvc"))]
+            log::warn!(
+                "Double lock error detected in USB stack. Meditations: services/usb-bao1x/src/hw.rs@226 (composite_handler inner loop) and consider adding more IRQ enable/disable similar to libs/bao1x-hal/src/usb/driver.rs@2549 (write impl)"
             );
         }
         match opcode {
@@ -692,9 +691,20 @@ pub(crate) fn main_hw() -> ! {
                         SerialListenMode::ConsoleListener => {
                             match std::str::from_utf8(&serial_buf) {
                                 Ok(s) => {
+                                    // Don't wait on the keyboard server: it logs, and log lines
+                                    // come back into this loop's queue through the USB console
+                                    // mirror. Keys that don't fit are dropped with the rest of
+                                    // the batch.
+                                    let mut dropped = 0;
                                     for c in s.chars() {
-                                        phase!(dbg, crate::uvc::PHASE_INJECT_KEY, native_kbd.inject_key(c));
+                                        if dropped > 0 || native_kbd.try_inject_key(c).is_err() {
+                                            dropped += 1;
+                                        }
                                     }
+                                    #[cfg(feature = "uvc")]
+                                    dbg.drop_keys.fetch_add(dropped, Ordering::SeqCst);
+                                    #[cfg(not(feature = "uvc"))]
+                                    let _ = dropped;
                                 }
                                 Err(_) => {
                                     log::info!("Non UTF-8 received on console: {:x?}", &serial_buf);
@@ -971,12 +981,8 @@ pub(crate) fn main_hw() -> ! {
                 } else if cu.uvc.frame_busy() {
                     // the previous frame is still going out; hold the caller until it completes
                     if uvc_pending.is_some() {
+                        // counted, not logged: the stream paths of this loop don't log
                         dbg.refused_frames.fetch_add(1, Ordering::SeqCst);
-                        phase!(
-                            dbg,
-                            crate::uvc::PHASE_LOG,
-                            log::warn!("UVC: second frame offered while one is already waiting; dropping")
-                        );
                         if let Some(mem) = msg.body.memory_message_mut() {
                             mem.valid = xous::MemorySize::new(UVC_RESULT_NOT_STREAMING);
                         }
@@ -985,7 +991,7 @@ pub(crate) fn main_hw() -> ! {
                     }
                 } else if let Some(staging) = uvc_staging.as_mut() {
                     if let Some((n, len, last, eof)) =
-                        uvc_stage_chunk(msg, staging.as_slice_mut::<u8>(), &mut uvc_fid)
+                        uvc_stage_chunk(msg, staging.as_slice_mut::<u8>(), &mut uvc_fid, &dbg)
                     {
                         cu.uvc.set_chunk(n, len, last, eof);
                         cu.sw_irq(UsbIrqReq::UvcKick);
@@ -998,7 +1004,7 @@ pub(crate) fn main_hw() -> ! {
                     match uvc_staging.as_mut() {
                         Some(staging) if cu.uvc.is_streaming() && !cu.uvc.frame_busy() => {
                             if let Some((n, len, last, eof)) =
-                                uvc_stage_chunk(&mut env, staging.as_slice_mut::<u8>(), &mut uvc_fid)
+                                uvc_stage_chunk(&mut env, staging.as_slice_mut::<u8>(), &mut uvc_fid, &dbg)
                             {
                                 cu.uvc.set_chunk(n, len, last, eof);
                                 cu.sw_irq(UsbIrqReq::UvcKick);
@@ -1015,23 +1021,15 @@ pub(crate) fn main_hw() -> ! {
             }
             #[cfg(feature = "uvc")]
             Opcode::IrqUvcStreamChange => msg_scalar_unpack!(msg, state, mode, _, _, {
+                // counted, not logged (bao-video logs the camera starting and stopping)
                 dbg.stream_changes.fetch_add(1, Ordering::SeqCst);
-                phase!(
-                    dbg,
-                    crate::uvc::PHASE_LOG,
-                    log::info!(
-                        "UVC stream {} (mode {})",
-                        if state != 0 { "started" } else { "stopped" },
-                        mode
-                    )
-                );
                 if let Some(mut env) = uvc_pending.take() {
                     // any frame in progress was abandoned by the state change; the staging buffer
                     // is free again.
                     match uvc_staging.as_mut() {
                         Some(staging) if state != 0 && cu.uvc.is_streaming() && !cu.uvc.frame_busy() => {
                             if let Some((n, len, last, eof)) =
-                                uvc_stage_chunk(&mut env, staging.as_slice_mut::<u8>(), &mut uvc_fid)
+                                uvc_stage_chunk(&mut env, staging.as_slice_mut::<u8>(), &mut uvc_fid, &dbg)
                             {
                                 cu.uvc.set_chunk(n, len, last, eof);
                                 cu.sw_irq(UsbIrqReq::UvcKick);
@@ -1155,6 +1153,7 @@ fn uvc_stage_chunk(
     env: &mut xous::MessageEnvelope,
     staging: &mut [u8],
     fid: &mut u8,
+    dbg: &crate::uvc::DebugCounters,
 ) -> Option<(usize, usize, usize, bool)> {
     let mem = env.body.memory_message_mut()?;
     let len = mem.valid.map(|v| v.get()).unwrap_or(0);
@@ -1169,7 +1168,7 @@ fn uvc_stage_chunk(
         || payload_data == 0
         || payload_data > api::UVC_MAX_PAYLOAD_DATA
     {
-        log::warn!("UVC: bad chunk offered ({} bytes, payload {}, buffer {})", len, payload_data, data.len());
+        dbg.bad_chunks.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         mem.valid = xous::MemorySize::new(api::UVC_RESULT_BAD_FRAME);
         return None;
     }
