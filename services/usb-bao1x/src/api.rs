@@ -77,6 +77,10 @@ pub enum Opcode {
     /// UVC stream started (arg1 = 1) or stopped (arg1 = 0) by the host
     #[cfg(feature = "uvc")]
     IrqUvcStreamChange = 771,
+    /// Fault injection from `uvc::VENDOR_REQ_INJECT`: hold the main loop for arg1 ms, then log
+    /// a line unless arg2 is 1
+    #[cfg(feature = "uvc")]
+    IrqDebugStall = 772,
 
     /// Lend a chunk of a raw UYVY frame for transmission over UVC. `valid` carries the chunk
     /// length in and a `UVC_RESULT_*` code out; `offset` carries `UVC_CHUNK_*` flags and the

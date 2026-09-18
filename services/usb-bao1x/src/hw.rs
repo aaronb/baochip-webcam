@@ -375,11 +375,16 @@ pub(crate) fn composite_handler(_irq_no: usize, arg: *mut usize) {
                 let polled = device.poll(&mut [class, serial as &mut dyn UsbClass<_>, uvc]);
                 if polled {
                     if let Ok(count) = serial.read(&mut usb.serial_rx) {
-                        xous::try_send_message(
+                        let sent = xous::try_send_message(
                             usb.conn,
                             Message::new_scalar(Opcode::IrqSerialRx.to_usize().unwrap(), count, 0, 0, 0),
-                        )
-                        .ok();
+                        );
+                        #[cfg(feature = "uvc")]
+                        if sent.is_err() {
+                            uvc.dbg.drop_serial_rx.fetch_add(1, Ordering::SeqCst);
+                        }
+                        #[cfg(not(feature = "uvc"))]
+                        sent.ok();
                     }
                     match class.device::<NKROBootKeyboard<_>, _>().read_report() {
                         Ok(l) => {

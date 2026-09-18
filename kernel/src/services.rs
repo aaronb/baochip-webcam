@@ -283,7 +283,7 @@ impl Process {
     }
 
     /// Reveal state for debugging outside the crate.
-    #[cfg(all(feature = "debug-swap-verbose", baremetal))]
+    #[cfg(all(any(feature = "debug-swap-verbose", feature = "debug-proc"), baremetal))]
     pub fn state(&self) -> ProcessState { self.state }
 }
 

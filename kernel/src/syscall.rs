@@ -1531,6 +1531,10 @@ pub fn handle_inner(pid: PID, tid: TID, in_irq: bool, call: SysCall) -> SysCallR
                     // return with the calling virtual address as affirmation of the call
                     Ok(xous_kernel::Result::Scalar5(a2, 0, 0, 0, 0))
                 }
+                #[cfg(feature = "debug-proc")]
+                PlatformCallAbi::DebugThreads | PlatformCallAbi::DebugServers => {
+                    crate::debug::dump::handle(pid, PlatformCallAbi::from(op), a2)
+                }
                 _ => {
                     println!(
                         "Invalid PlatformCallAbi: {:x} {:x} {:x} {:x} {:x} {:x} {:x}",

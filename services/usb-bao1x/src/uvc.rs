@@ -86,12 +86,37 @@ const PROBE_LEN: usize = 26;
 const UYVY_GUID: [u8; 16] =
     [b'U', b'Y', b'V', b'Y', 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71];
 
-/// Vendor request (device-to-host, recipient device) that returns `DebugCounters`. Answered in
-/// interrupt context, so it works even when the service's main loop is wedged.
+/// Vendor request (device-to-host, recipient device) that returns `DebugCounters`: wValue 0 for
+/// the original 32-byte report, 1 for `DebugCounters::extended_report`. Vendor requests are
+/// answered in interrupt context, so they work even when the service's main loop is wedged.
 pub const VENDOR_REQ_DEBUG: u8 = 0x51;
+/// Vendor request for the kernel thread and server tables (`DebugDump`). wValue `DUMP_REQUEST`
+/// asks the watchdog thread for a new capture; otherwise wValue is the table (0 threads,
+/// 1 servers) and wIndex the byte offset. Every reply starts with the capture's generation, 0
+/// while a capture is being written.
+pub const VENDOR_REQ_DUMP: u8 = 0x52;
+pub const DUMP_REQUEST: u16 = 0xffff;
+/// Vendor request that injects a fault, for testing hang fixes. wValue `INJECT_STALL` holds the
+/// main loop for wIndex ms and then logs a line, `INJECT_STALL_QUIET` holds it without logging,
+/// and `INJECT_FLOOD` logs wIndex lines from a helper thread. Replies 1 if the request was taken.
+pub const VENDOR_REQ_INJECT: u8 = 0x53;
+pub const INJECT_STALL: u16 = 1;
+pub const INJECT_STALL_QUIET: u16 = 2;
+pub const INJECT_FLOOD: u16 = 3;
 
-/// Liveness counters readable over USB with `VENDOR_REQ_DEBUG`. Written by the main loop and the
-/// interrupt handler; read in interrupt context.
+/// `DebugCounters::phase`: what the main loop is doing. Anything but idle for seconds is a hang.
+pub const PHASE_IDLE: u32 = 0;
+pub const PHASE_HANDLING: u32 = 1;
+pub const PHASE_INJECT_KEY: u32 = 2;
+pub const PHASE_LOG: u32 = 3;
+pub const PHASE_NAMES: u32 = 4;
+pub const PHASE_SERIAL_WRITE: u32 = 5;
+pub const PHASE_SLEEP: u32 = 6;
+pub const PHASE_LOG_HOOK: u32 = 7;
+pub const PHASE_BUS_RESET: u32 = 8;
+
+/// Liveness counters readable over USB with `VENDOR_REQ_DEBUG`. Written by the main loop, the
+/// interrupt handler and the watchdog thread; read in interrupt context.
 #[derive(Default)]
 pub struct DebugCounters {
     /// incremented once per main-loop iteration
@@ -106,6 +131,213 @@ pub struct DebugCounters {
     pub completions: AtomicU32,
     /// number of VS_COMMIT requests accepted
     pub commits: AtomicU32,
+    /// `PHASE_*`
+    pub phase: AtomicU32,
+    /// the last opcodes the main loop received, in a ring
+    opcodes: [AtomicU32; 8],
+    opcode_pos: AtomicU32,
+    /// ms since `main_ticks` last moved, as the watchdog thread saw it
+    pub still_ms: AtomicU32,
+    /// watchdog thread iterations; if this stops, so has the watchdog
+    pub watchdog_beats: AtomicU32,
+    /// notifications refused because the receiving queue was full
+    pub drop_frame_done: AtomicU32,
+    pub drop_stream_change: AtomicU32,
+    pub drop_serial_rx: AtomicU32,
+    pub drop_observer: AtomicU32,
+    pub drop_inject: AtomicU32,
+    /// console keys dropped because the keyboard server's queue was full
+    pub drop_keys: AtomicU32,
+    /// frames offered while another was already waiting
+    pub refused_frames: AtomicU32,
+    pub bad_chunks: AtomicU32,
+    pub double_locks: AtomicU32,
+    pub stream_changes: AtomicU32,
+    /// lines `INJECT_FLOOD` still has to log
+    flood_lines: AtomicU32,
+}
+
+impl DebugCounters {
+    /// Main loop: note a received message
+    pub fn record_opcode(&self, id: u32) {
+        let pos = self.opcode_pos.fetch_add(1, Ordering::SeqCst) as usize;
+        self.opcodes[pos % self.opcodes.len()].store(id, Ordering::SeqCst);
+        self.last_opcode.store(id, Ordering::SeqCst);
+    }
+
+    /// `VENDOR_REQ_DEBUG` wValue 1: phase, ms since the main loop moved, watchdog beats, the
+    /// last 8 opcodes oldest first (u16), the drop counters (u16: frame done, stream change,
+    /// serial rx, observer, inject, refused frames, bad chunks, double locks), then u32 keys
+    /// dropped, stream changes, and the dump generation.
+    fn extended_report(&self, dump_generation: u32) -> [u8; 56] {
+        let mut d = [0u8; 56];
+        let load = |a: &AtomicU32| a.load(Ordering::SeqCst);
+        d[0..4].copy_from_slice(&load(&self.phase).to_le_bytes());
+        d[4..8].copy_from_slice(&load(&self.still_ms).to_le_bytes());
+        d[8..12].copy_from_slice(&load(&self.watchdog_beats).to_le_bytes());
+        let pos = load(&self.opcode_pos) as usize;
+        for i in 0..self.opcodes.len() {
+            let op = load(&self.opcodes[(pos + i) % self.opcodes.len()]) as u16;
+            d[12 + 2 * i..14 + 2 * i].copy_from_slice(&op.to_le_bytes());
+        }
+        let small = [
+            &self.drop_frame_done,
+            &self.drop_stream_change,
+            &self.drop_serial_rx,
+            &self.drop_observer,
+            &self.drop_inject,
+            &self.refused_frames,
+            &self.bad_chunks,
+            &self.double_locks,
+        ];
+        for (i, a) in small.iter().enumerate() {
+            d[28 + 2 * i..30 + 2 * i].copy_from_slice(&(load(a).min(0xffff) as u16).to_le_bytes());
+        }
+        d[44..48].copy_from_slice(&load(&self.drop_keys).to_le_bytes());
+        d[48..52].copy_from_slice(&load(&self.stream_changes).to_le_bytes());
+        d[52..56].copy_from_slice(&dump_generation.to_le_bytes());
+        d
+    }
+}
+
+const PAGE: usize = 4096;
+/// kernel `PlatformCallAbi::DebugThreads` and `DebugServers` (`debug-proc` kernels only)
+const KERNEL_DEBUG_THREADS: usize = 4;
+const KERNEL_DEBUG_SERVERS: usize = 5;
+const DUMP_TABLES: usize = 2;
+/// `VENDOR_REQ_DUMP` reply size: kept under the 64-byte EP0 packet so it is a single short packet
+const DUMP_REPLY: usize = 60;
+/// how often the watchdog thread looks at the main loop
+const WATCH_MS: usize = 250;
+/// a main loop inside a handler for this long gets a dump without being asked
+const AUTO_DUMP_MS: u32 = 5000;
+
+#[repr(C, align(4096))]
+struct DebugPage([u8; PAGE]);
+
+/// Kernel thread and server tables (layouts in the kernel's `debug::dump`), captured by the
+/// watchdog thread because the kernel calls can't be made from interrupt context, and read out
+/// in pieces with `VENDOR_REQ_DUMP`.
+pub struct DebugDump {
+    /// capture number, 0 while a capture is being written
+    generation: AtomicU32,
+    captures: AtomicU32,
+    requested: AtomicBool,
+    /// `DUMP_TABLES` pages, allocated once for the life of the process
+    tables: *mut u8,
+}
+
+// Safety: the watchdog thread is the only writer, and a reader discards any copy that a capture
+// overlapped (see `read`).
+unsafe impl Send for DebugDump {}
+unsafe impl Sync for DebugDump {}
+
+impl DebugDump {
+    pub fn new() -> Self {
+        Self {
+            generation: AtomicU32::new(0),
+            captures: AtomicU32::new(0),
+            requested: AtomicBool::new(false),
+            tables: Box::leak(vec![0u8; DUMP_TABLES * PAGE].into_boxed_slice()).as_mut_ptr(),
+        }
+    }
+
+    pub fn generation(&self) -> u32 { self.generation.load(Ordering::SeqCst) }
+
+    /// Watchdog thread: take both tables from the kernel
+    fn capture(&self, scratch: &mut DebugPage) {
+        let number = self.captures.fetch_add(1, Ordering::SeqCst) + 1;
+        self.generation.store(0, Ordering::SeqCst);
+        for (i, op) in [KERNEL_DEBUG_THREADS, KERNEL_DEBUG_SERVERS].iter().enumerate() {
+            scratch.0.fill(0);
+            let taken = xous::rsyscall(xous::SysCall::PlatformSpecific(
+                *op,
+                scratch.0.as_mut_ptr() as usize,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ))
+            .is_ok();
+            unsafe {
+                let dst = self.tables.add(i * PAGE);
+                if taken {
+                    core::ptr::copy_nonoverlapping(scratch.0.as_ptr(), dst, PAGE);
+                } else {
+                    core::ptr::write_bytes(dst, 0, PAGE);
+                }
+            }
+        }
+        self.generation.store(number, Ordering::SeqCst);
+    }
+
+    /// Interrupt context: one `VENDOR_REQ_DUMP` reply. Returns its length.
+    fn read(&self, table: usize, offset: usize, out: &mut [u8; DUMP_REPLY]) -> usize {
+        let generation = self.generation();
+        let mut len = 4;
+        if generation != 0 && table < DUMP_TABLES && offset < PAGE {
+            let n = (PAGE - offset).min(DUMP_REPLY - 4);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.tables.add(table * PAGE + offset),
+                    out[4..].as_mut_ptr(),
+                    n,
+                )
+            };
+            len += n;
+        }
+        // a capture that began during the copy makes it worthless
+        let generation = if self.generation() == generation { generation } else { 0 };
+        out[..4].copy_from_slice(&generation.to_le_bytes());
+        len
+    }
+}
+
+/// Start the watchdog thread, which takes a `DebugDump` when asked or when the main loop has sat
+/// in one phase of a handler for `AUTO_DUMP_MS`, and the thread that serves `INJECT_FLOOD`. The
+/// watchdog must not log: the log server can be part of a hang.
+pub fn start_debug_threads(dbg: Arc<DebugCounters>, dump: Arc<DebugDump>) {
+    std::thread::spawn({
+        let dbg = dbg.clone();
+        move || {
+            let tt = ticktimer::Ticktimer::new().unwrap();
+            let mut scratch = Box::new(DebugPage([0; PAGE]));
+            let mut last = (dbg.main_ticks.load(Ordering::SeqCst), dbg.phase.load(Ordering::SeqCst));
+            let mut still_ms = 0u32;
+            let mut auto_taken = false;
+            loop {
+                tt.sleep_ms(WATCH_MS).ok();
+                dbg.watchdog_beats.fetch_add(1, Ordering::SeqCst);
+                // a handler that moves on to another phase (a long sleep ending in a stuck log
+                // call) gets a fresh dump of the phase it ends up stuck in
+                let now = (dbg.main_ticks.load(Ordering::SeqCst), dbg.phase.load(Ordering::SeqCst));
+                if now != last {
+                    last = now;
+                    still_ms = 0;
+                    auto_taken = false;
+                } else {
+                    still_ms = still_ms.saturating_add(WATCH_MS as u32);
+                }
+                dbg.still_ms.store(still_ms, Ordering::SeqCst);
+                let stuck = still_ms >= AUTO_DUMP_MS && now.1 != PHASE_IDLE;
+                if dump.requested.swap(false, Ordering::SeqCst) || (stuck && !auto_taken) {
+                    auto_taken |= stuck;
+                    dump.capture(&mut scratch);
+                }
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        let tt = ticktimer::Ticktimer::new().unwrap();
+        loop {
+            tt.sleep_ms(100).ok();
+            let lines = dbg.flood_lines.swap(0, Ordering::SeqCst);
+            for i in 0..lines {
+                log::info!("debug flood {}/{}", i + 1, lines);
+            }
+        }
+    });
 }
 
 /// Payload header bits
@@ -153,7 +385,8 @@ pub struct UvcClass<'a, B: UsbBus> {
     /// index of the payload slot currently in flight
     cursor: usize,
     chunk: Chunk,
-    pub dbg: DebugCounters,
+    pub dbg: Arc<DebugCounters>,
+    pub dump: Arc<DebugDump>,
 }
 
 impl<'a, B: UsbBus> UvcClass<'a, B> {
@@ -190,7 +423,8 @@ impl<'a, B: UsbBus> UvcClass<'a, B> {
             discard_completion: false,
             cursor: 0,
             chunk: Chunk::default(),
-            dbg: DebugCounters::default(),
+            dbg: Arc::new(DebugCounters::default()),
+            dump: Arc::new(DebugDump::new()),
         }
     }
 
@@ -259,7 +493,7 @@ impl<'a, B: UsbBus> UvcClass<'a, B> {
     }
 
     fn notify_stream_state(&self, state: usize) {
-        xous::try_send_message(
+        if xous::try_send_message(
             self.conn,
             xous::Message::new_scalar(
                 Opcode::IrqUvcStreamChange.to_usize().unwrap(),
@@ -269,15 +503,21 @@ impl<'a, B: UsbBus> UvcClass<'a, B> {
                 0,
             ),
         )
-        .ok();
+        .is_err()
+        {
+            self.dbg.drop_stream_change.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     fn notify_chunk_done(&self) {
-        xous::try_send_message(
+        if xous::try_send_message(
             self.conn,
             xous::Message::new_scalar(Opcode::IrqUvcFrameDone.to_usize().unwrap(), 0, 0, 0, 0),
         )
-        .ok();
+        .is_err()
+        {
+            self.dbg.drop_frame_done.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     fn start_stream(&mut self) {
@@ -481,14 +721,58 @@ impl<'a, B: UsbBus> UsbClass<B> for UvcClass<'a, B> {
 
     fn control_in(&mut self, xfer: ControlIn<B>) {
         let req = *xfer.request();
-        if req.request_type == RequestType::Vendor
-            && req.recipient == Recipient::Device
-            && req.request == VENDOR_REQ_DEBUG
-        {
-            let data = self.debug_report();
-            let len = (req.length as usize).min(data.len());
-            xfer.accept_with(&data[..len]).ok();
-            return;
+        if req.request_type == RequestType::Vendor && req.recipient == Recipient::Device {
+            let len = req.length as usize;
+            match req.request {
+                VENDOR_REQ_DEBUG if req.value == 1 => {
+                    let data = self.dbg.extended_report(self.dump.generation());
+                    xfer.accept_with(&data[..len.min(data.len())]).ok();
+                    return;
+                }
+                VENDOR_REQ_DEBUG => {
+                    let data = self.debug_report();
+                    xfer.accept_with(&data[..len.min(data.len())]).ok();
+                    return;
+                }
+                VENDOR_REQ_DUMP => {
+                    let mut out = [0u8; DUMP_REPLY];
+                    let n = if req.value == DUMP_REQUEST {
+                        self.dump.requested.store(true, Ordering::SeqCst);
+                        out[..4].copy_from_slice(&self.dump.generation().to_le_bytes());
+                        4
+                    } else {
+                        self.dump.read(req.value as usize, req.index as usize, &mut out)
+                    };
+                    xfer.accept_with(&out[..n.min(len)]).ok();
+                    return;
+                }
+                VENDOR_REQ_INJECT => {
+                    let taken = match req.value {
+                        INJECT_STALL | INJECT_STALL_QUIET => xous::try_send_message(
+                            self.conn,
+                            xous::Message::new_scalar(
+                                Opcode::IrqDebugStall.to_usize().unwrap(),
+                                req.index as usize,
+                                (req.value == INJECT_STALL_QUIET) as usize,
+                                0,
+                                0,
+                            ),
+                        )
+                        .is_ok(),
+                        INJECT_FLOOD => {
+                            self.dbg.flood_lines.store(req.index as u32, Ordering::SeqCst);
+                            true
+                        }
+                        _ => false,
+                    };
+                    if !taken {
+                        self.dbg.drop_inject.fetch_add(1, Ordering::SeqCst);
+                    }
+                    xfer.accept_with(&[taken as u8][..len.min(1)]).ok();
+                    return;
+                }
+                _ => {}
+            }
         }
         if req.request_type != RequestType::Class || req.recipient != Recipient::Interface {
             return;

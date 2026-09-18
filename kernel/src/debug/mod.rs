@@ -6,5 +6,8 @@ mod macros;
 #[cfg(baremetal)]
 pub mod shell;
 
+#[cfg(all(baremetal, feature = "bao1x", feature = "debug-proc"))]
+pub mod dump;
+
 #[cfg(all(baremetal, feature = "gdb-stub"))]
 pub mod gdb;

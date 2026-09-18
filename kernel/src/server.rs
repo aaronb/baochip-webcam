@@ -902,6 +902,16 @@ impl Server {
         self.tail_generation != self.head_generation.wrapping_sub(1)
     }
 
+    /// Queue fill for the `DebugServers` platform call: messages not yet received, slots in use
+    /// (those messages plus replies still owed), slots in total, and the mask of this server's
+    /// threads waiting to receive. The queue lives in the server's address space, so the owning
+    /// process must be active.
+    #[cfg(feature = "debug-proc")]
+    pub fn debug_queue_stats(&self) -> (u8, usize, usize, usize) {
+        let used = self.queue.iter().filter(|e| **e != QueuedMessage::Empty).count();
+        (self.tail_generation.wrapping_sub(self.head_generation), used, self.queue.len(), self.ready_threads)
+    }
+
     /// Add the given message to this server's queue.
     ///
     /// # Errors

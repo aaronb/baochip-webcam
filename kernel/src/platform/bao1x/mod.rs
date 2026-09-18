@@ -79,6 +79,10 @@ pub enum PlatformCallAbi {
     DebugFreeMem = 1,
     DebugProcesses = 2,
     DebugInterrupts = 3,
+    /// Binary table of every thread's saved registers (see `debug::dump`)
+    DebugThreads = 4,
+    /// Binary table of every server's queue fill (see `debug::dump`)
+    DebugServers = 5,
 }
 
 impl PlatformCallAbi {
@@ -89,6 +93,8 @@ impl PlatformCallAbi {
             1 => DebugFreeMem,
             2 => DebugProcesses,
             3 => DebugInterrupts,
+            4 => DebugThreads,
+            5 => DebugServers,
             _ => Invalid,
         }
     }

@@ -33,6 +33,22 @@ enum SerialListenMode {
     ConsoleListener,
 }
 
+/// Evaluate `$body` with the main loop's debug phase (`uvc::PHASE_*`) set to `$phase`, so a hang
+/// inside it shows up in `uvc_debug.py`. Without `uvc` there are no debug counters.
+#[cfg(all(target_os = "xous", feature = "uvc"))]
+macro_rules! phase {
+    ($dbg:expr, $phase:expr, $body:expr) => {{
+        let previous = $dbg.phase.swap($phase, core::sync::atomic::Ordering::SeqCst);
+        let result = $body;
+        $dbg.phase.store(previous, core::sync::atomic::Ordering::SeqCst);
+        result
+    }};
+}
+#[cfg(all(target_os = "xous", not(feature = "uvc")))]
+macro_rules! phase {
+    ($dbg:expr, $phase:expr, $body:expr) => {{ $body }};
+}
+
 fn main() -> ! {
     #[cfg(target_os = "xous")]
     main_hw();
@@ -171,6 +187,10 @@ pub(crate) fn main_hw() -> ! {
     let mut cu =
         Box::new(Bao1xUsb::new(usb.clone(), irq_csr.clone(), cid, cw, &usb_alloc, &serial_number, uvc_phys));
     cu.init();
+    #[cfg(feature = "uvc")]
+    let dbg = cu.uvc.dbg.clone();
+    #[cfg(feature = "uvc")]
+    crate::uvc::start_debug_threads(dbg.clone(), cu.uvc.dump.clone());
 
     // Serial driver variables
     let mut serial_listener: Option<xous::MessageEnvelope> = None;
@@ -316,15 +336,18 @@ pub(crate) fn main_hw() -> ! {
 
     let mut msg_opt = None;
     loop {
+        #[cfg(feature = "uvc")]
+        dbg.phase.store(crate::uvc::PHASE_IDLE, Ordering::SeqCst);
         xous::reply_and_receive_next(usbdev_sid, &mut msg_opt).expect("Error fetching next message");
         let msg = msg_opt.as_mut().unwrap();
         let opcode = num_traits::FromPrimitive::from_usize(msg.body.id()).unwrap_or(Opcode::InvalidCall);
         log::debug!("{:?}", opcode);
         #[cfg(feature = "uvc")]
         {
-            cu.uvc.dbg.main_ticks.fetch_add(1, Ordering::SeqCst);
-            cu.uvc.dbg.last_opcode.store(msg.body.id() as u32, Ordering::SeqCst);
-            cu.uvc.dbg.listen_mode.store(
+            dbg.phase.store(crate::uvc::PHASE_HANDLING, Ordering::SeqCst);
+            dbg.main_ticks.fetch_add(1, Ordering::SeqCst);
+            dbg.record_opcode(msg.body.id() as u32);
+            dbg.listen_mode.store(
                 match serial_listen_mode {
                     SerialListenMode::NoListener => 0,
                     SerialListenMode::AsciiListener(_) => 1,
@@ -335,8 +358,14 @@ pub(crate) fn main_hw() -> ! {
             );
         }
         if cu.double_lock_detected() {
-            log::warn!(
-                "Double lock error detected in USB stack. Meditations: services/usb-bao1x/src/hw.rs@226 (composite_handler inner loop) and consider adding more IRQ enable/disable similar to libs/bao1x-hal/src/usb/driver.rs@2549 (write impl)"
+            #[cfg(feature = "uvc")]
+            dbg.double_locks.fetch_add(1, Ordering::SeqCst);
+            phase!(
+                dbg,
+                crate::uvc::PHASE_LOG,
+                log::warn!(
+                    "Double lock error detected in USB stack. Meditations: services/usb-bao1x/src/hw.rs@226 (composite_handler inner loop) and consider adding more IRQ enable/disable similar to libs/bao1x-hal/src/usb/driver.rs@2549 (write impl)"
+                )
             );
         }
         match opcode {
@@ -612,7 +641,11 @@ pub(crate) fn main_hw() -> ! {
                 let buffer = unsafe { Buffer::from_memory_message(msg.body.memory_message().unwrap()) };
                 let ur = buffer.as_flat::<UsbListenerRegistration, _>().unwrap();
                 if observer_conn.is_none() {
-                    match xns.request_connection_blocking(ur.server_name.as_str()) {
+                    match phase!(
+                        dbg,
+                        crate::uvc::PHASE_NAMES,
+                        xns.request_connection_blocking(ur.server_name.as_str())
+                    ) {
                         Ok(cid) => {
                             observer_conn = Some(cid);
                             observer_op = Some(<u32 as From<u32>>::from(ur.listener_op_id.into()) as usize);
@@ -660,7 +693,7 @@ pub(crate) fn main_hw() -> ! {
                             match std::str::from_utf8(&serial_buf) {
                                 Ok(s) => {
                                     for c in s.chars() {
-                                        native_kbd.inject_key(c);
+                                        phase!(dbg, crate::uvc::PHASE_INJECT_KEY, native_kbd.inject_key(c));
                                     }
                                 }
                                 Err(_) => {
@@ -739,15 +772,19 @@ pub(crate) fn main_hw() -> ! {
             }
             Opcode::SerialHookConsole => msg_scalar_unpack!(msg, _, _, _, _, {
                 let log_conn = xous::connect(xous::SID::from_bytes(b"xous-log-server ").unwrap()).unwrap();
-                match xous::send_message(
-                    log_conn,
-                    xous::Message::new_blocking_scalar(
-                        log_server::api::Opcode::TryHookUsbMirror.to_usize().unwrap(),
-                        0,
-                        0,
-                        0,
-                        0,
-                    ),
+                match phase!(
+                    dbg,
+                    crate::uvc::PHASE_LOG_HOOK,
+                    xous::send_message(
+                        log_conn,
+                        xous::Message::new_blocking_scalar(
+                            log_server::api::Opcode::TryHookUsbMirror.to_usize().unwrap(),
+                            0,
+                            0,
+                            0,
+                            0,
+                        ),
+                    )
                 ) {
                     Ok(xous::Result::Scalar1(result)) => {
                         if result == 1 {
@@ -766,17 +803,21 @@ pub(crate) fn main_hw() -> ! {
             Opcode::SerialClearHooks => {
                 let log_conn = xous::connect(xous::SID::from_bytes(b"xous-log-server ").unwrap()).unwrap();
                 // it is never harmful to double-unhook this
-                xous::send_message(
-                    log_conn,
-                    xous::Message::new_blocking_scalar(
-                        log_server::api::Opcode::UnhookUsbMirror.to_usize().unwrap(),
-                        0,
-                        0,
-                        0,
-                        0,
-                    ),
-                )
-                .ok();
+                phase!(
+                    dbg,
+                    crate::uvc::PHASE_LOG_HOOK,
+                    xous::send_message(
+                        log_conn,
+                        xous::Message::new_blocking_scalar(
+                            log_server::api::Opcode::UnhookUsbMirror.to_usize().unwrap(),
+                            0,
+                            0,
+                            0,
+                            0,
+                        ),
+                    )
+                    .ok()
+                );
 
                 serial_listen_mode = SerialListenMode::NoListener;
                 serial_listener.take();
@@ -787,7 +828,7 @@ pub(crate) fn main_hw() -> ! {
                 }
                 // The interrupt handler may access the same usbd-serial state through
                 // UsbDevice::poll(), so the flush must use the IRQ-safe wrapper.
-                cu.serial_flush_irq_safe().ok();
+                phase!(dbg, crate::uvc::PHASE_SERIAL_WRITE, cu.serial_flush_irq_safe().ok());
                 // this tries to return any data that's pending within the main loop's buffers
                 match serial_listen_mode {
                     SerialListenMode::BinaryListener => {
@@ -837,7 +878,7 @@ pub(crate) fn main_hw() -> ! {
                 // This is a best-effort, non-blocking path. Stop at the first short
                 // write or error because only a contiguous prefix can be accepted.
                 for chunk in data.d.chunks(crate::hw::SERIAL_MAX_PACKET_SIZE) {
-                    match cu.serial_write_irq_safe(chunk) {
+                    match phase!(dbg, crate::uvc::PHASE_SERIAL_WRITE, cu.serial_write_irq_safe(chunk)) {
                         Ok(sent) if sent == chunk.len() => {}
                         Ok(_) | Err(_) => break,
                     }
@@ -865,7 +906,7 @@ pub(crate) fn main_hw() -> ! {
                 // Only a contiguous prefix is reported as accepted. Stop at the
                 // first short write or error and let the caller retry the remainder.
                 for chunk in request.d.chunks(crate::hw::SERIAL_MAX_PACKET_SIZE) {
-                    match cu.serial_write_irq_safe(chunk) {
+                    match phase!(dbg, crate::uvc::PHASE_SERIAL_WRITE, cu.serial_write_irq_safe(chunk)) {
                         Ok(sent) => {
                             total_sent += sent;
 
@@ -891,7 +932,11 @@ pub(crate) fn main_hw() -> ! {
                             for chunk in
                                 usb_send.s.as_bytes().chunks(bao1x_hal::usb::driver::CRG_UDC_APP_BUFSIZE)
                             {
-                                cu.serial_write_irq_safe(&chunk).ok();
+                                phase!(
+                                    dbg,
+                                    crate::uvc::PHASE_SERIAL_WRITE,
+                                    cu.serial_write_irq_safe(&chunk).ok()
+                                );
                             }
                         }
                         _ => {} // silent errors
@@ -902,7 +947,11 @@ pub(crate) fn main_hw() -> ! {
             Opcode::RegisterUvcObserver => {
                 let buffer = unsafe { Buffer::from_memory_message(msg.body.memory_message().unwrap()) };
                 let ur = buffer.as_flat::<UsbListenerRegistration, _>().unwrap();
-                match xns.request_connection_blocking(ur.server_name.as_str()) {
+                match phase!(
+                    dbg,
+                    crate::uvc::PHASE_NAMES,
+                    xns.request_connection_blocking(ur.server_name.as_str())
+                ) {
                     Ok(cid) => {
                         let op = <u32 as From<u32>>::from(ur.listener_op_id.into()) as usize;
                         log::info!("UVC observer registered: {} op {}", ur.server_name.as_str(), op);
@@ -922,7 +971,12 @@ pub(crate) fn main_hw() -> ! {
                 } else if cu.uvc.frame_busy() {
                     // the previous frame is still going out; hold the caller until it completes
                     if uvc_pending.is_some() {
-                        log::warn!("UVC: second frame offered while one is already waiting; dropping");
+                        dbg.refused_frames.fetch_add(1, Ordering::SeqCst);
+                        phase!(
+                            dbg,
+                            crate::uvc::PHASE_LOG,
+                            log::warn!("UVC: second frame offered while one is already waiting; dropping")
+                        );
                         if let Some(mem) = msg.body.memory_message_mut() {
                             mem.valid = xous::MemorySize::new(UVC_RESULT_NOT_STREAMING);
                         }
@@ -961,7 +1015,16 @@ pub(crate) fn main_hw() -> ! {
             }
             #[cfg(feature = "uvc")]
             Opcode::IrqUvcStreamChange => msg_scalar_unpack!(msg, state, mode, _, _, {
-                log::info!("UVC stream {} (mode {})", if state != 0 { "started" } else { "stopped" }, mode);
+                dbg.stream_changes.fetch_add(1, Ordering::SeqCst);
+                phase!(
+                    dbg,
+                    crate::uvc::PHASE_LOG,
+                    log::info!(
+                        "UVC stream {} (mode {})",
+                        if state != 0 { "started" } else { "stopped" },
+                        mode
+                    )
+                );
                 if let Some(mut env) = uvc_pending.take() {
                     // any frame in progress was abandoned by the state change; the staging buffer
                     // is free again.
@@ -983,11 +1046,24 @@ pub(crate) fn main_hw() -> ! {
                 }
                 if let Some((cid, op)) = uvc_observer {
                     // arg2 = 0: from the USB service (not the console); arg3 = mode index
-                    xous::try_send_message(cid, xous::Message::new_scalar(op, state, 0, mode, 0)).ok();
+                    if xous::try_send_message(cid, xous::Message::new_scalar(op, state, 0, mode, 0)).is_err()
+                    {
+                        dbg.drop_observer.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }),
+            #[cfg(feature = "uvc")]
+            Opcode::IrqDebugStall => msg_scalar_unpack!(msg, ms, quiet, _, _, {
+                // `uvc_debug.py inject stall`: hold this loop so its queue fills up behind it, then
+                // log a line (unless quiet), which is where a log server waiting on that queue
+                // deadlocks with it
+                phase!(dbg, crate::uvc::PHASE_SLEEP, tt.sleep_ms(ms).ok());
+                if quiet == 0 {
+                    phase!(dbg, crate::uvc::PHASE_LOG, log::info!("debug: main loop held for {} ms", ms));
                 }
             }),
             Opcode::UsbBusReset => {
-                log::warn!("USB bus reset requested");
+                phase!(dbg, crate::uvc::PHASE_LOG, log::warn!("USB bus reset requested"));
                 #[cfg(feature = "uvc")]
                 {
                     if let Some(mut env) = uvc_pending.take() {
@@ -997,10 +1073,16 @@ pub(crate) fn main_hw() -> ! {
                     }
                     cu.uvc.reset_state();
                     if let Some((cid, op)) = uvc_observer {
-                        xous::try_send_message(cid, xous::Message::new_scalar(op, 0, 0, 0, 0)).ok();
+                        if xous::try_send_message(cid, xous::Message::new_scalar(op, 0, 0, 0, 0)).is_err() {
+                            dbg.drop_observer.fetch_add(1, Ordering::SeqCst);
+                        }
                     }
                 }
-                usb_device::bus::UsbBus::force_reset(cu.device.bus()).ok();
+                phase!(
+                    dbg,
+                    crate::uvc::PHASE_BUS_RESET,
+                    usb_device::bus::UsbBus::force_reset(cu.device.bus()).ok()
+                );
             }
             Opcode::UvcStatus => {
                 if let Some(scalar) = msg.body.scalar_message_mut() {
