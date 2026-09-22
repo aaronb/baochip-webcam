@@ -63,8 +63,12 @@ jobs:
             cp "${BUILD_DIR}/${f}.uf2" "dist/${name}/"
           done
           cp .github/webcam-firmware/FLASHING.md "dist/${name}/"
+          # bare file names, so `sha256sum -c SHA256SUMS` works next to the downloaded
+          # files; the UF2 sums go in before zipping so the zip carries them too
+          (cd "dist/${name}" && sha256sum *.uf2 > SHA256SUMS)
           (cd dist && zip -r "${name}.zip" "${name}")
-          sha256sum "dist/${name}"/*.uf2 "dist/${name}.zip" | tee "dist/${name}/SHA256SUMS"
+          (cd dist && sha256sum "${name}.zip" >> "${name}/SHA256SUMS")
+          cat "dist/${name}/SHA256SUMS"
           echo "ver=${ver}" >> "$GITHUB_OUTPUT"
           echo "name=${name}" >> "$GITHUB_OUTPUT"
 
