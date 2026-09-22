@@ -1,5 +1,15 @@
 # Xous Core
 
+> [!NOTE]
+> **This is the DEF CON 34 badge USB-webcam fork of Xous.** Pre-built firmware for the
+> badge is on the [Releases page](https://github.com/aaronb/baochip-webcam/releases):
+> download the three UF2 files and follow the flashing steps in
+> [`.github/webcam-firmware/FLASHING.md`](.github/webcam-firmware/FLASHING.md).
+> **Flashing developer-signed firmware erases the badge's secrets and puts it in developer
+> mode permanently**, so read that file first. The webcam design, bench tooling and the
+> bugs fixed on the way are in [`webcam-tools/README.md`](webcam-tools/README.md). Every
+> push to `dev` is built by the `Webcam firmware` workflow; tagging `v*` publishes a release.
+
 Xous is a microkernel operating system written in pure Rust, built for high-assurance applications.
 
 Key features:

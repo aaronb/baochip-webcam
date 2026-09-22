@@ -1,0 +1,90 @@
+# Builds the DEF CON 34 badge USB-webcam firmware (loader, kernel, swap as UF2) and
+# publishes it: every push to `dev` uploads a workflow artifact, every `v*` tag also
+# creates a GitHub Release with the same files so people can download and flash
+# without a GitHub account or a toolchain. The build command is the one documented
+# in webcam-tools/README.md.
+name: Webcam firmware
+
+on:
+  push:
+    branches: [dev]
+    tags: ['v*']
+  pull_request:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  BUILD_DIR: target/riscv32imac-unknown-xous-elf/release
+
+jobs:
+  firmware:
+    name: Build badge webcam firmware
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          # xtask and xous-sign-image both run `git describe`, which needs the
+          # full history and the annotated v* tags.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Update to latest toolchain
+        run: rustup update
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          # The target tree is built against the Xous libstd installed below, which
+          # can change between runs; keep only the registry/git caches.
+          cache-targets: false
+
+      - name: Install RISC-V toolkit (Xous libstd)
+        run: cargo xtask install-toolkit --force --no-verify
+
+      - name: Build firmware
+        run: |
+          cargo xtask baosec-lite dc34-console~flash dc34-vault \
+            --no-timestamp --feature usb --feature uvc --feature hazardous-usb-ci \
+            --kernel-feature debug-proc --no-verify
+
+      - name: Package
+        id: package
+        run: |
+          set -eu
+          ver="$(git describe --tags --long --abbrev=9)"
+          name="baochip-webcam-firmware-${ver}"
+          mkdir -p "dist/${name}"
+          for f in loader xous swap; do
+            cp "${BUILD_DIR}/${f}.uf2" "dist/${name}/"
+          done
+          cp .github/webcam-firmware/FLASHING.md "dist/${name}/"
+          (cd dist && zip -r "${name}.zip" "${name}")
+          sha256sum "dist/${name}"/*.uf2 "dist/${name}.zip" | tee "dist/${name}/SHA256SUMS"
+          echo "ver=${ver}" >> "$GITHUB_OUTPUT"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/${{ steps.package.outputs.name }}/
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Badge webcam firmware ${{ github.ref_name }}
+          body_path: .github/webcam-firmware/FLASHING.md
+          files: |
+            dist/${{ steps.package.outputs.name }}.zip
+            dist/${{ steps.package.outputs.name }}/loader.uf2
+            dist/${{ steps.package.outputs.name }}/xous.uf2
+            dist/${{ steps.package.outputs.name }}/swap.uf2
+            dist/${{ steps.package.outputs.name }}/SHA256SUMS
