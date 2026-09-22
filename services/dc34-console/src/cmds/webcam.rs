@@ -158,7 +158,7 @@ impl<'a> ShellCmdApi<'a> for Webcam {
                     (Some(w), Some(h), Some(ratio)) => {
                         let (pad, rowlen) = (pad.unwrap_or(24), rowlen.unwrap_or(0));
                         match gfx.webcam_raw(w, h, ratio, pad, rowlen) {
-                            Ok(_) => write!(
+                            Ok(true) => write!(
                                 ret,
                                 "raw capture {}x{} ratio {} pad {} DMA row length {}",
                                 w,
@@ -168,6 +168,8 @@ impl<'a> ShellCmdApi<'a> for Webcam {
                                 if rowlen == 0 { w + pad } else { rowlen }
                             )
                             .ok(),
+                            // bao-video logs why
+                            Ok(false) => write!(ret, "raw capture refused: geometry not usable").ok(),
                             Err(e) => write!(ret, "error: {:?}", e).ok(),
                         }
                     }
