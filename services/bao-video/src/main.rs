@@ -208,6 +208,10 @@ struct WebcamState {
     sent: usize,
     dropped: usize,
     restarts: usize,
+    /// capture sessions started (every `webcam_start_capture`, restarts included). A watchdog is
+    /// armed for one session: `captured` restarts from 0 with every host or console start, so a
+    /// stale watchdog would otherwise match a fresh session that has not produced a frame yet.
+    session: usize,
     /// 32-bit words the frame copy skips at the start of every captured line. 0: the ring
     /// capture restarts the pipeline every frame, and lines start on the sensor's first pixel
     /// (measured 2026-09-15 at 768x576 and 160x120 on scenes with a dark right edge); the 3-word
@@ -301,6 +305,7 @@ impl WebcamState {
             sent: 0,
             dropped: 0,
             restarts: 0,
+            session: 0,
             crop_words: 0,
             rowlen_override: 0,
             mode: 0,
@@ -408,6 +413,7 @@ fn webcam_start_capture(
 ) {
     let mode = webcam.custom.unwrap_or(UVC_MODES[webcam.mode]);
     let clkdiv_ratio1 = webcam.clkdiv_ratio1;
+    webcam.session = webcam.session.wrapping_add(1);
     udma_global.reset(PeriphId::Cam);
     camera_power_up(iox, timer, cam_clk, cam_pdwn, tt);
     let (pid, mid) = cam.read_id(i2c);
@@ -743,19 +749,84 @@ fn webcam_wb_step(cam: &mut Gc2145, i2c: &mut I2c, webcam: &mut WebcamState) {
     }
 }
 
-/// Schedule a `WebcamWatchdog` check: if no frame has arrived by then, the camera is restarted.
+/// Schedule a `WebcamWatchdog` check: if the session is still the current one and no frame has
+/// arrived by then, the camera is restarted.
 #[cfg(feature = "uvc")]
-fn webcam_arm_watchdog(cid: CID, captured_now: usize, tt: &ticktimer::Ticktimer) {
+fn webcam_arm_watchdog(cid: CID, webcam: &WebcamState, tt: &ticktimer::Ticktimer) {
     let _ = tt;
+    let (session, captured_now) = (webcam.session, webcam.captured);
     std::thread::spawn(move || {
         let tt = ticktimer::Ticktimer::new().unwrap();
         tt.sleep_ms(2500).ok();
         xous::try_send_message(
             cid,
-            xous::Message::new_scalar(GfxOpcode::WebcamWatchdog.to_usize().unwrap(), captured_now, 0, 0, 0),
+            xous::Message::new_scalar(
+                GfxOpcode::WebcamWatchdog.to_usize().unwrap(),
+                session,
+                captured_now,
+                0,
+                0,
+            ),
         )
         .ok();
     });
+}
+
+/// The console's bring-up geometry (`webcam raw`), from the `WebcamControl` arguments
+/// `arg3 = w << 16 | h` and `arg4 = rowlen << 16 | ratio << 8 | pad`, refused when the capture
+/// path cannot handle it: a payload holds at least one row (so a chunk fits the frame buffer),
+/// the frame copy takes whole words, the sensor window (`(w + pad) * ratio` by
+/// `(h + 1) * ratio`, see `Gc2145::set_resolution`) fits the array, a DMA row length override
+/// covers the width, and a ring slot fits the camera IFRAM. Returns the mode and the DMA row
+/// length override (0: the padded width).
+#[cfg(feature = "uvc")]
+fn webcam_raw_mode(arg3: usize, arg4: usize, ifram_len: usize) -> Result<(UvcMode, usize), String> {
+    const SENSOR_W: usize = 1600;
+    const SENSOR_H: usize = 1200;
+    let (w, h) = (arg3 >> 16, arg3 & 0xffff);
+    let (rowlen, ratio, pad) = (arg4 >> 16, (arg4 >> 8) & 0xff, arg4 & 0xff);
+    let max_w = usb_bao1x::UVC_MAX_PAYLOAD_DATA / 2;
+    if w < 2 || w % 2 != 0 || w > max_w {
+        return Err(format!("width {} is not even and between 2 and {}", w, max_w));
+    }
+    if h == 0 {
+        return Err("height is 0".to_string());
+    }
+    // even ratios, or odd ones up to 7 (read in groups of twice the ratio; the group size is a
+    // nibble), see `UvcMode::ratio`
+    if ratio == 0 || ratio > 14 || (ratio % 2 != 0 && ratio > 7) {
+        return Err(format!("ratio {} is not even up to 14 or odd up to 7", ratio));
+    }
+    if (w + pad) * ratio > SENSOR_W || (h + 1) * ratio > SENSOR_H {
+        return Err(format!(
+            "sensor window {}x{} exceeds {}x{}",
+            (w + pad) * ratio,
+            (h + 1) * ratio,
+            SENSOR_W,
+            SENSOR_H
+        ));
+    }
+    if rowlen != 0 && rowlen < w {
+        return Err(format!("DMA row length {} is shorter than the width", rowlen));
+    }
+    let payload_rows = (usb_bao1x::UVC_MAX_PAYLOAD_DATA / (w * 2)).max(1);
+    let slot_rows = (UVC_CHUNK_PAYLOADS * payload_rows).min(h.max(payload_rows));
+    let line_px = if rowlen != 0 { rowlen } else { w + pad };
+    if slot_rows * line_px * 2 > ifram_len {
+        return Err(format!("ring slot of {} bytes exceeds the camera IFRAM", slot_rows * line_px * 2));
+    }
+    Ok((
+        UvcMode {
+            width: w,
+            height: h,
+            ratio: ratio as u16,
+            line_pad: pad,
+            interval: 10_000_000,
+            payload_rows,
+            slot_rows,
+        },
+        rowlen,
+    ))
 }
 
 fn main() -> ! {
@@ -1421,6 +1492,9 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                     &mut webcam,
                                 );
                                 webcam_apply_settings(&mut cam, &mut i2c, &mut webcam);
+                                // the restarted session needs its own watchdog: the one armed at
+                                // start saw the frames before the restart and is satisfied
+                                webcam_arm_watchdog(cid, &webcam, &tt);
                                 break;
                             }
                         }
@@ -1618,22 +1692,21 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                         webcam.host_streaming = on;
                     }
                     let raw = if source == 2 {
-                        // console bring-up geometry: arg3 = w << 16 | h, arg4 = rowlen << 16 |
-                        // ratio << 8 | pad (rowlen 0: the camera DMA counts the padded width)
-                        let (w, h) = (arg3 >> 16, arg3 & 0xffff);
-                        let (ratio, pad) = (((arg4 >> 8) & 0xff) as u16, arg4 & 0xff);
-                        webcam.rowlen_override = arg4 >> 16;
-                        let payload_rows = (4800 / (w * 2)).max(1);
-                        let slot_rows = (UVC_CHUNK_PAYLOADS * payload_rows).min(h.max(payload_rows));
-                        Some(UvcMode {
-                            width: w,
-                            height: h,
-                            ratio,
-                            line_pad: pad,
-                            interval: 10_000_000,
-                            payload_rows,
-                            slot_rows,
-                        })
+                        // console bring-up geometry, checked before it reaches the capture path:
+                        // this is the display server, and a bad size would panic it
+                        match webcam_raw_mode(arg3, arg4, cam.ifram_len()) {
+                            Ok((m, rowlen)) => {
+                                webcam.rowlen_override = rowlen;
+                                Some(m)
+                            }
+                            Err(e) => {
+                                log::warn!("webcam: raw geometry refused: {}", e);
+                                if let Some(scalar) = msg.body.scalar_message_mut() {
+                                    scalar.arg1 = 0;
+                                }
+                                continue;
+                            }
+                        }
                     } else {
                         None
                     };
@@ -1689,7 +1762,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                 &mut webcam,
                             );
                             webcam_apply_settings(&mut cam, &mut i2c, &mut webcam);
-                            webcam_arm_watchdog(cid, webcam.captured, &tt);
+                            webcam_arm_watchdog(cid, &webcam, &tt);
                             webcam_panel_orientation(&mut display, &udma_global, &webcam);
                             log::info!("webcam started");
                         }
@@ -1727,8 +1800,11 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                 #[cfg(feature = "uvc")]
                 GfxOpcode::WebcamWatchdog => {
                     if let Some(scalar) = msg.body.scalar_message() {
-                        let captured_at_arm = scalar.arg1;
-                        if webcam.active && webcam.captured == captured_at_arm {
+                        let (session_at_arm, captured_at_arm) = (scalar.arg1, scalar.arg2);
+                        if webcam.active
+                            && webcam.session == session_at_arm
+                            && webcam.captured == captured_at_arm
+                        {
                             const RESTART_LIMIT: usize = 3;
                             if webcam.restarts < RESTART_LIMIT {
                                 webcam.restarts += 1;
@@ -1751,7 +1827,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                                     &mut webcam,
                                 );
                                 webcam_apply_settings(&mut cam, &mut i2c, &mut webcam);
-                                webcam_arm_watchdog(cid, webcam.captured, &tt);
+                                webcam_arm_watchdog(cid, &webcam, &tt);
                             } else {
                                 log::error!("webcam: camera never produced a frame; giving up");
                                 webcam.active = false;
