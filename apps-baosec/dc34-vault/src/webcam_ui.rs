@@ -259,6 +259,9 @@ impl WebcamUi {
 
     fn set_view(&mut self, view: u8) {
         self.view = view.min(VIEW_ZOOM);
+        // chosen from the menu: the menu's `MenuDone` follows this action, and must not put the
+        // view it saved back over the one chosen
+        self.menu_saved_view = None;
         // a preview needs the camera running; the status page gives a locally started one up
         if self.view != VIEW_STATUS {
             if !self.gfx.webcam_status().map(|s| s.active).unwrap_or(false) {
@@ -328,7 +331,8 @@ impl WebcamUi {
         }
     }
 
-    /// The menu has closed: restore the preview and refresh the page.
+    /// The menu has closed: restore the preview (unless the menu's action chose a view, which
+    /// `set_view` applied and took the saved one) and refresh the page.
     pub fn menu_closed(&mut self) {
         if let Some(v) = self.menu_saved_view.take() {
             self.gfx.webcam_preview_view(v).ok();
