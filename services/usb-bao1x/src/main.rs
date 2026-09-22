@@ -357,6 +357,10 @@ pub(crate) fn main_hw() -> ! {
                 Ordering::SeqCst,
             );
         }
+        // Before the message: the parked chunk goes first, and a `UvcSendFrame` arriving now
+        // then finds the staging buffer busy and takes its place in `uvc_pending`.
+        #[cfg(feature = "uvc")]
+        uvc_resume_pending(&mut uvc_pending, &mut cu, uvc_staging.as_mut(), &mut uvc_fid, &dbg);
         if cu.double_lock_detected() {
             // UVC builds count it for `uvc_debug.py` rather than log from whatever message it
             // shows up on, which is often a burst of mirrored log lines
@@ -1000,48 +1004,14 @@ pub(crate) fn main_hw() -> ! {
             }
             #[cfg(feature = "uvc")]
             Opcode::IrqUvcFrameDone => {
-                if let Some(mut env) = uvc_pending.take() {
-                    match uvc_staging.as_mut() {
-                        Some(staging) if cu.uvc.is_streaming() && !cu.uvc.frame_busy() => {
-                            if let Some((n, len, last, eof)) =
-                                uvc_stage_chunk(&mut env, staging.as_slice_mut::<u8>(), &mut uvc_fid, &dbg)
-                            {
-                                cu.uvc.set_chunk(n, len, last, eof);
-                                cu.sw_irq(UsbIrqReq::UvcKick);
-                            }
-                        }
-                        _ => {
-                            if let Some(mem) = env.body.memory_message_mut() {
-                                mem.valid = xous::MemorySize::new(UVC_RESULT_NOT_STREAMING);
-                            }
-                        }
-                    }
-                    // `env` drops here, which replies to the waiting frame source
-                }
+                // the parked chunk, if any, was resumed before the message was dispatched
             }
             #[cfg(feature = "uvc")]
             Opcode::IrqUvcStreamChange => msg_scalar_unpack!(msg, state, mode, _, _, {
-                // counted, not logged (bao-video logs the camera starting and stopping)
+                // counted, not logged (bao-video logs the camera starting and stopping). A parked
+                // chunk was already dealt with before dispatch: the state change abandoned any
+                // frame in progress, so it was staged into the new stream or refused.
                 dbg.stream_changes.fetch_add(1, Ordering::SeqCst);
-                if let Some(mut env) = uvc_pending.take() {
-                    // any frame in progress was abandoned by the state change; the staging buffer
-                    // is free again.
-                    match uvc_staging.as_mut() {
-                        Some(staging) if state != 0 && cu.uvc.is_streaming() && !cu.uvc.frame_busy() => {
-                            if let Some((n, len, last, eof)) =
-                                uvc_stage_chunk(&mut env, staging.as_slice_mut::<u8>(), &mut uvc_fid, &dbg)
-                            {
-                                cu.uvc.set_chunk(n, len, last, eof);
-                                cu.sw_irq(UsbIrqReq::UvcKick);
-                            }
-                        }
-                        _ => {
-                            if let Some(mem) = env.body.memory_message_mut() {
-                                mem.valid = xous::MemorySize::new(UVC_RESULT_NOT_STREAMING);
-                            }
-                        }
-                    }
-                }
                 if let Some((cid, op)) = uvc_observer {
                     // arg2 = 0: from the USB service (not the console); arg3 = mode index
                     if xous::try_send_message(cid, xous::Message::new_scalar(op, state, 0, mode, 0)).is_err()
@@ -1064,12 +1034,9 @@ pub(crate) fn main_hw() -> ! {
                 phase!(dbg, crate::uvc::PHASE_LOG, log::warn!("USB bus reset requested"));
                 #[cfg(feature = "uvc")]
                 {
-                    if let Some(mut env) = uvc_pending.take() {
-                        if let Some(mem) = env.body.memory_message_mut() {
-                            mem.valid = xous::MemorySize::new(UVC_RESULT_NOT_STREAMING);
-                        }
-                    }
                     cu.uvc.reset_state();
+                    // the stream is down now, so a parked chunk is refused
+                    uvc_resume_pending(&mut uvc_pending, &mut cu, uvc_staging.as_mut(), &mut uvc_fid, &dbg);
                     if let Some((cid, op)) = uvc_observer {
                         if xous::try_send_message(cid, xous::Message::new_scalar(op, 0, 0, 0, 0)).is_err() {
                             dbg.drop_observer.fetch_add(1, Ordering::SeqCst);
@@ -1178,4 +1145,43 @@ fn uvc_stage_chunk(
     let (n, plen, last_len) = crate::uvc::stage_chunk(staging, &data[..len], payload_data, *fid, last);
     mem.valid = xous::MemorySize::new(api::UVC_RESULT_SENT);
     Some((n, plen, last_len, last))
+}
+
+/// Deal with a chunk parked in `pending` while the staging buffer was busy: stage it now if the
+/// host is still streaming and the buffer is free, reply that the stream is gone if it stopped,
+/// and leave it parked while its predecessor is still going out. Runs once per main loop
+/// message rather than only on `IrqUvcFrameDone`: the IRQ handler sends that with
+/// `try_send_message`, which fails when this server's queue is full (a burst of mirrored log
+/// lines does it), and a lost notification left the parked lend unanswered, which blocked
+/// bao-video, and every Gfx caller behind it, until the host closed the stream.
+#[cfg(all(target_os = "xous", feature = "uvc"))]
+fn uvc_resume_pending(
+    pending: &mut Option<xous::MessageEnvelope>,
+    cu: &mut hw::Bao1xUsb,
+    staging: Option<&mut bao1x_hal::ifram::IframRange>,
+    fid: &mut u8,
+    dbg: &crate::uvc::DebugCounters,
+) {
+    if pending.is_none() || (cu.uvc.is_streaming() && cu.uvc.frame_busy()) {
+        return;
+    }
+    let Some(mut env) = pending.take() else {
+        return;
+    };
+    match staging {
+        Some(staging) if cu.uvc.is_streaming() => {
+            if let Some((n, len, last, eof)) =
+                uvc_stage_chunk(&mut env, staging.as_slice_mut::<u8>(), fid, dbg)
+            {
+                cu.uvc.set_chunk(n, len, last, eof);
+                cu.sw_irq(hw::UsbIrqReq::UvcKick);
+            }
+        }
+        _ => {
+            if let Some(mem) = env.body.memory_message_mut() {
+                mem.valid = xous::MemorySize::new(api::UVC_RESULT_NOT_STREAMING);
+            }
+        }
+    }
+    // `env` drops here, which replies to the waiting frame source
 }
