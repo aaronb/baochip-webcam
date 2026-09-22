@@ -1761,7 +1761,6 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                     }
                 }
                 #[cfg(feature = "uvc")]
-                #[cfg(feature = "uvc")]
                 GfxOpcode::WebcamExposure => {
                     let (a1, a2, a3, a4) = match msg.body.scalar_message() {
                         Some(sc) => (sc.arg1, sc.arg2, sc.arg3, sc.arg4),
@@ -2004,6 +2003,7 @@ pub fn wrapped_main(main_thread_token: MainThreadToken) -> ! {
                             (e.awb[0] as usize) << 16 | (e.awb[1] as usize) << 8 | e.awb[2] as usize;
                     }
                 }
+                #[cfg(feature = "uvc")]
                 GfxOpcode::WebcamStatus => {
                     if let Some(scalar) = msg.body.scalar_message_mut() {
                         scalar.arg1 = if webcam.active { 1 } else { 0 };
